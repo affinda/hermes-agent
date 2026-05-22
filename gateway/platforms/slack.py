@@ -2932,6 +2932,7 @@ class SlackAdapter(BasePlatformAdapter):
             f"dm_or_group_dm: {str(bool(is_dm)).lower()}\n"
             f"attention_expires_in_seconds: {expires_in}\n"
             f"message_ts: {current_ts}\n"
+            "response_controls: prepend <slack_route mode=\"channel\" /> to reply outside the current thread; prepend <slack_route mode=\"thread\" /> to force a thread reply; output only <slack_no_reply /> to stay quiet. These control tags are stripped before posting.\n"
             "[End Slack event]\n\n"
         )
 

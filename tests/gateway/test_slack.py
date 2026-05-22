@@ -3312,6 +3312,8 @@ class TestSlackHumanLikeContext:
         msg_event = contextual_adapter.handle_message.call_args[0][0]
         assert "[Slack event]" in msg_event.text
         assert "agent_was_mentioned: true" in msg_event.text
+        assert '<slack_route mode="channel" />' in msg_event.text
+        assert '<slack_no_reply />' in msg_event.text
         assert "[Recent channel context" in msg_event.text
         assert "U_ALICE: first gap" in msg_event.text
         assert "U_BOB: second gap" in msg_event.text
