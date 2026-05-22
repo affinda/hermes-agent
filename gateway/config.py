@@ -828,6 +828,16 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["reply_in_thread"] = platform_cfg["reply_in_thread"]
                 if "require_mention" in platform_cfg:
                     bridged["require_mention"] = platform_cfg["require_mention"]
+                if plat == Platform.SLACK:
+                    for _slack_key in (
+                        "human_context_enabled",
+                        "context_lookback_messages",
+                        "attention_window_minutes",
+                        "thread_gap_messages",
+                        "event_packet_enabled",
+                    ):
+                        if _slack_key in platform_cfg:
+                            bridged[_slack_key] = platform_cfg[_slack_key]
                 if plat == Platform.TELEGRAM and "allowed_chats" in platform_cfg:
                     bridged["allowed_chats"] = platform_cfg["allowed_chats"]
                 if plat == Platform.TELEGRAM and "group_allowed_chats" in platform_cfg:

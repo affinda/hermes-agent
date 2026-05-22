@@ -3177,3 +3177,374 @@ class TestSlashEphemeralAck:
         # the normal single-user case; the ContextVar path is the precise one.
         # The key invariant is: when the ContextVar IS set, it matches exactly.
         assert ctx is not None  # fallback path finds the entry
+
+
+# ---------------------------------------------------------------------------
+# TestSlackHumanLikeContext
+# ---------------------------------------------------------------------------
+
+class TestSlackHumanLikeContext:
+    class DictLikeSlackResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def get(self, key, default=None):
+            return self.payload.get(key, default)
+
+    @pytest.fixture()
+    def contextual_adapter(self):
+        config = PlatformConfig(enabled=True, token="***", extra={
+            "human_context_enabled": True,
+            "context_lookback_messages": 3,
+            "attention_window_minutes": 5,
+        })
+        a = SlackAdapter(config)
+        a._app = MagicMock()
+        a._app.client = AsyncMock()
+        a._bot_user_id = "U_BOT"
+        a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
+        a._running = True
+        a.handle_message = AsyncMock()
+        a._resolve_user_name = AsyncMock(side_effect=lambda uid, chat_id=None: uid)
+        return a
+
+    @pytest.mark.asyncio
+    async def test_channel_mention_includes_recent_gap_context_and_event_packet(self, contextual_adapter):
+        contextual_adapter._app.client.conversations_history = AsyncMock(return_value={
+            "messages": [
+                {"ts": "105.000", "user": "U_USER", "text": "<@U_BOT> current request", "team": "T_TEAM"},
+                {"ts": "104.000", "user": "U_BOB", "text": "second gap", "team": "T_TEAM"},
+                {"ts": "103.000", "user": "U_ALICE", "text": "first gap", "team": "T_TEAM"},
+                {"ts": "102.000", "user": "U_OLD", "text": "too old", "team": "T_TEAM"},
+            ]
+        })
+        contextual_adapter._resolve_user_name = AsyncMock(side_effect=lambda uid, chat_id=None: uid)
+
+        await contextual_adapter._handle_slack_message({
+            "text": "<@U_BOT> current request",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "105.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        })
+
+        msg_event = contextual_adapter.handle_message.call_args[0][0]
+        assert "[Slack event]" in msg_event.text
+        assert "agent_was_mentioned: true" in msg_event.text
+        assert "[Recent channel context" in msg_event.text
+        assert "U_ALICE: first gap" in msg_event.text
+        assert "U_BOB: second gap" in msg_event.text
+        assert "too old" not in msg_event.text
+        assert msg_event.text.rstrip().endswith("current request")
+        contextual_adapter._app.client.conversations_history.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_channel_gap_context_uses_last_seen_timestamp(self, contextual_adapter):
+        contextual_adapter._slack_context_last_seen[("channel", "C123", None)] = "103.000"
+        contextual_adapter._app.client.conversations_history = AsyncMock(return_value={
+            "messages": [
+                {"ts": "105.000", "user": "U_USER", "text": "<@U_BOT> current request", "team": "T_TEAM"},
+                {"ts": "104.000", "user": "U_BOB", "text": "new gap", "team": "T_TEAM"},
+                {"ts": "103.000", "user": "U_ALICE", "text": "already seen", "team": "T_TEAM"},
+            ]
+        })
+        contextual_adapter._resolve_user_name = AsyncMock(side_effect=lambda uid, chat_id=None: uid)
+
+        await contextual_adapter._handle_slack_message({
+            "text": "<@U_BOT> current request",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "105.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        })
+
+        msg_event = contextual_adapter.handle_message.call_args[0][0]
+        assert "U_BOB: new gap" in msg_event.text
+        assert "already seen" not in msg_event.text
+
+    @pytest.mark.asyncio
+    async def test_context_fetch_accepts_slack_response_like_objects(self, contextual_adapter):
+        contextual_adapter._app.client.conversations_history = AsyncMock(return_value=self.DictLikeSlackResponse({
+            "messages": [
+                {"ts": "105.000", "user": "U_USER", "text": "<@U_BOT> current request", "team": "T_TEAM"},
+                {"ts": "104.000", "user": "U_BOB", "text": "dict-like response gap", "team": "T_TEAM"},
+            ]
+        }))
+
+        await contextual_adapter._handle_slack_message({
+            "text": "<@U_BOT> current request",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "105.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        })
+
+        msg_event = contextual_adapter.handle_message.call_args[0][0]
+        assert "U_BOB: dict-like response gap" in msg_event.text
+
+    @pytest.mark.asyncio
+    async def test_human_context_requires_explicit_opt_in(self):
+        config = PlatformConfig(enabled=True, token="***", extra={
+            "context_lookback_messages": 3,
+            "event_packet_enabled": False,
+        })
+        a = SlackAdapter(config)
+        a._app = MagicMock()
+        a._app.client = AsyncMock()
+        a._bot_user_id = "U_BOT"
+        a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
+        a._running = True
+        a.handle_message = AsyncMock()
+        a._resolve_user_name = AsyncMock(side_effect=lambda uid, chat_id=None: uid)
+
+        await a._handle_slack_message({
+            "text": "<@U_BOT> current request",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "105.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        })
+
+        msg_event = a.handle_message.call_args[0][0]
+        assert "[Slack event]" not in msg_event.text
+        assert "[Recent channel context" not in msg_event.text
+        assert msg_event.text == "current request"
+
+    @pytest.mark.asyncio
+    async def test_attention_window_processes_unmentioned_channel_message_as_passive(self, contextual_adapter, monkeypatch):
+        monkeypatch.setattr(_slack_mod.time, "monotonic", lambda: 100.0)
+        await contextual_adapter._handle_slack_message({
+            "text": "<@U_BOT> please watch this",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "100.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        })
+        contextual_adapter.handle_message.reset_mock()
+        monkeypatch.setattr(_slack_mod.time, "monotonic", lambda: 120.0)
+
+        await contextual_adapter._handle_slack_message({
+            "text": "additional detail without mention",
+            "user": "U_OTHER",
+            "channel": "C123",
+            "ts": "121.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        })
+
+        contextual_adapter.handle_message.assert_called_once()
+        msg_event = contextual_adapter.handle_message.call_args[0][0]
+        assert "agent_was_mentioned: false" in msg_event.text
+        assert "passive_followup: true" in msg_event.text
+        assert msg_event.source.thread_id == "100.000"
+        assert msg_event.text.rstrip().endswith("additional detail without mention")
+
+    @pytest.mark.asyncio
+    async def test_attention_window_expiry_ignores_unmentioned_channel_message(self, contextual_adapter, monkeypatch):
+        contextual_adapter._slack_attention_until[("channel", "C123", None)] = 110.0
+        monkeypatch.setattr(_slack_mod.time, "monotonic", lambda: 111.0)
+
+        await contextual_adapter._handle_slack_message({
+            "text": "too late without mention",
+            "user": "U_OTHER",
+            "channel": "C123",
+            "ts": "111.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        })
+
+        contextual_adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dm_always_processes_without_attention_or_mention(self, contextual_adapter):
+        await contextual_adapter._handle_slack_message({
+            "text": "hello in dm",
+            "user": "U_USER",
+            "channel": "D123",
+            "ts": "200.000",
+            "channel_type": "im",
+            "team": "T_TEAM",
+        })
+
+        contextual_adapter.handle_message.assert_called_once()
+        msg_event = contextual_adapter.handle_message.call_args[0][0]
+        assert msg_event.source.chat_type == "dm"
+        assert "agent_was_mentioned: false" in msg_event.text
+        assert msg_event.text.rstrip().endswith("hello in dm")
+
+    @pytest.mark.asyncio
+    async def test_thread_gap_context_uses_last_seen_timestamp(self, contextual_adapter):
+        contextual_adapter._slack_context_last_seen[("thread", "C123", "100.000")] = "102.000"
+        contextual_adapter._mentioned_threads.add("100.000")
+        contextual_adapter._app.client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"ts": "103.000", "user": "U_BOB", "text": "thread gap", "team": "T_TEAM"},
+                {"ts": "102.000", "user": "U_ALICE", "text": "already seen", "team": "T_TEAM"},
+                {"ts": "104.000", "user": "U_USER", "text": "<@U_BOT> current", "team": "T_TEAM"},
+            ]
+        })
+        contextual_adapter._resolve_user_name = AsyncMock(side_effect=lambda uid, chat_id=None: uid)
+
+        await contextual_adapter._handle_slack_message({
+            "text": "<@U_BOT> current",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "104.000",
+            "thread_ts": "100.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        })
+
+        msg_event = contextual_adapter.handle_message.call_args[0][0]
+        assert "[Thread context — new messages since you last saw this Slack thread:]" in msg_event.text
+        assert "U_BOB: thread gap" in msg_event.text
+        assert "already seen" not in msg_event.text
+        assert msg_event.text.rstrip().endswith("current")
+
+    @pytest.mark.asyncio
+    async def test_first_thread_entry_fetches_full_thread_even_with_existing_session(self, contextual_adapter):
+        contextual_adapter._has_active_session_for_thread = MagicMock(return_value=True)
+        contextual_adapter._app.client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"ts": "100.000", "user": "U_ALICE", "text": "thread parent", "team": "T_TEAM"},
+                {"ts": "101.000", "user": "U_BOB", "text": "prior reply", "team": "T_TEAM"},
+                {"ts": "102.000", "user": "U_USER", "text": "<@U_BOT> current", "team": "T_TEAM"},
+            ]
+        })
+        contextual_adapter._resolve_user_name = AsyncMock(side_effect=lambda uid, chat_id=None: uid)
+
+        await contextual_adapter._handle_slack_message({
+            "text": "<@U_BOT> current",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "102.000",
+            "thread_ts": "100.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        })
+
+        msg_event = contextual_adapter.handle_message.call_args[0][0]
+        assert "[Thread context — prior messages in this thread (not yet in conversation history):]" in msg_event.text
+        assert "U_ALICE: thread parent" in msg_event.text
+        assert "U_BOB: prior reply" in msg_event.text
+        assert "[Thread context — new messages" not in msg_event.text
+
+    @pytest.mark.asyncio
+    async def test_event_packet_can_be_disabled_while_context_still_enabled(self, contextual_adapter):
+        contextual_adapter.config.extra["human_context_enabled"] = True
+        contextual_adapter.config.extra["event_packet_enabled"] = False
+        contextual_adapter._app.client.conversations_history = AsyncMock(return_value={
+            "messages": [
+                {"ts": "105.000", "user": "U_USER", "text": "<@U_BOT> current request", "team": "T_TEAM"},
+                {"ts": "104.000", "user": "U_BOB", "text": "still included", "team": "T_TEAM"},
+            ]
+        })
+        contextual_adapter._resolve_user_name = AsyncMock(side_effect=lambda uid, chat_id=None: uid)
+
+        await contextual_adapter._handle_slack_message({
+            "text": "<@U_BOT> current request",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "105.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        })
+
+        msg_event = contextual_adapter.handle_message.call_args[0][0]
+        assert "[Slack event]" not in msg_event.text
+        assert "U_BOB: still included" in msg_event.text
+        assert msg_event.text.rstrip().endswith("current request")
+
+    @pytest.mark.asyncio
+    async def test_slack_route_channel_directive_sends_top_level(self, contextual_adapter):
+        contextual_adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "300.000"})
+
+        await contextual_adapter.send(
+            chat_id="C123",
+            content='<slack_route mode="channel" />\nPosting this in channel',
+            reply_to="299.000",
+            metadata={"thread_id": "299.000"},
+        )
+
+        kwargs = contextual_adapter._app.client.chat_postMessage.await_args.kwargs
+        assert kwargs["text"] == "Posting this in channel"
+        assert "thread_ts" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_slack_route_thread_directive_sends_in_thread(self, contextual_adapter):
+        contextual_adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "301.000"})
+
+        await contextual_adapter.send(
+            chat_id="C123",
+            content='<slack_route mode="thread" />\nThread reply',
+            reply_to="299.000",
+            metadata={},
+        )
+
+        kwargs = contextual_adapter._app.client.chat_postMessage.await_args.kwargs
+        assert kwargs["text"] == "Thread reply"
+        assert kwargs["thread_ts"] == "299.000"
+
+    @pytest.mark.asyncio
+    async def test_slack_no_reply_directive_suppresses_send(self, contextual_adapter):
+        contextual_adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "302.000"})
+
+        result = await contextual_adapter.send(
+            chat_id="C123",
+            content='<slack_no_reply reason="passive message does not need a response" />',
+            reply_to="299.000",
+            metadata={"thread_id": "299.000"},
+        )
+
+        assert result.success is True
+        assert result.message_id is None
+        contextual_adapter._app.client.chat_postMessage.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_reply_directive_clears_thread_status(self, contextual_adapter):
+        contextual_adapter._active_status_threads["C123"] = "299.000"
+        contextual_adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        contextual_adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "302.000"})
+
+        result = await contextual_adapter.send(
+            chat_id="C123",
+            content="<slack_no_reply />",
+            reply_to="299.000",
+            metadata={"thread_id": "299.000"},
+        )
+
+        assert result.success is True
+        contextual_adapter._app.client.chat_postMessage.assert_not_called()
+        contextual_adapter._app.client.assistant_threads_setStatus.assert_awaited_once_with(
+            channel_id="C123",
+            thread_ts="299.000",
+            status="",
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_reply_directive_consumes_slash_context_without_ephemeral(self, contextual_adapter):
+        import time
+        from gateway.platforms.slack import _slash_user_id
+
+        contextual_adapter._slash_command_contexts[("C123", "U_SLASH")] = {
+            "response_url": "https://hooks.slack.com/test",
+            "ts": time.monotonic(),
+        }
+        contextual_adapter._send_slash_ephemeral = AsyncMock()
+        contextual_adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "302.000"})
+
+        token = _slash_user_id.set("U_SLASH")
+        try:
+            result = await contextual_adapter.send(chat_id="C123", content="<slack_no_reply />")
+        finally:
+            _slash_user_id.reset(token)
+
+        assert result.success is True
+        assert contextual_adapter._slash_command_contexts == {}
+        contextual_adapter._send_slash_ephemeral.assert_not_called()
+        contextual_adapter._app.client.chat_postMessage.assert_not_called()

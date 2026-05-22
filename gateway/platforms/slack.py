@@ -10,6 +10,7 @@ Uses slack-bolt (Python) with Socket Mode for:
 
 import asyncio
 import contextvars
+import inspect
 import json
 import logging
 import os
@@ -348,6 +349,14 @@ class SlackAdapter(BasePlatformAdapter):
         # (channel_id, user_id) to avoid cross-user collisions.
         # Each value: {"response_url": str, "ts": float}
         self._slash_command_contexts: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # Human-like Slack context state.  A "surface" is either a channel
+        # top-level stream or a concrete Slack thread.  We track the newest
+        # timestamp injected into the agent so later turns can gap-fill only
+        # messages the agent has not already seen, and a short attention window
+        # for unmentioned channel follow-ups after an explicit mention.
+        self._slack_context_last_seen: Dict[Tuple[str, str, Optional[str]], str] = {}
+        self._slack_attention_until: Dict[Tuple[str, str, Optional[str]], float] = {}
+        self._slack_attention_thread_ts: Dict[Tuple[str, str, Optional[str]], str] = {}
 
     def _describe_slack_api_error(self, response: Any, *, file_obj: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """Convert Slack API auth/permission failures into actionable user-facing text."""
@@ -767,12 +776,19 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            cleanup_thread_ts = self._resolve_thread_ts(reply_to, metadata)
+            content, route_override, no_reply = self._strip_slack_route_directives(content)
+            slash_ctx = self._pop_slash_context(chat_id)
+            if no_reply:
+                if cleanup_thread_ts:
+                    await self.stop_typing(chat_id)
+                return SendResult(success=True, message_id=None, raw_response={"no_reply": True})
+
             # Check for a pending slash-command context.  When the user ran a
             # native slash command (e.g. /q, /stop, /model), the initial ack
             # already showed an ephemeral "Running /cmd…" message.  If we have
             # a stashed response_url for this channel, replace that ack with
             # the actual command reply ephemerally instead of posting publicly.
-            slash_ctx = self._pop_slash_context(chat_id)
             if slash_ctx:
                 return await self._send_slash_ephemeral(
                     slash_ctx, content,
@@ -784,7 +800,11 @@ class SlackAdapter(BasePlatformAdapter):
             # Split long messages, preserving code block boundaries
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
-            thread_ts = self._resolve_thread_ts(reply_to, metadata)
+            thread_ts = cleanup_thread_ts
+            if route_override == "channel":
+                thread_ts = None
+            elif route_override == "thread" and not thread_ts:
+                thread_ts = reply_to
             last_result = None
 
             # reply_broadcast: also post thread replies to the main channel.
@@ -806,7 +826,7 @@ class SlackAdapter(BasePlatformAdapter):
                 last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
 
             # Clear Slack Assistant status as soon as the final message is posted.
-            if thread_ts:
+            if cleanup_thread_ts:
                 await self.stop_typing(chat_id)
 
             # Track the sent message ts so we can auto-respond to thread
@@ -957,6 +977,118 @@ class SlackAdapter(BasePlatformAdapter):
         if raw is None:
             return True  # default: each DM thread is its own session
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _slack_bool_value(raw: Any, default: bool = False) -> bool:
+        if raw is None:
+            return default
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(raw)
+
+    def _slack_int_extra(self, name: str, default: int, minimum: int = 0) -> int:
+        raw = self.config.extra.get(name)
+        if raw is None:
+            return default
+        try:
+            return max(minimum, int(raw))
+        except (TypeError, ValueError):
+            return default
+
+    def _slack_float_extra(self, name: str, default: float, minimum: float = 0.0) -> float:
+        raw = self.config.extra.get(name)
+        if raw is None:
+            return default
+        try:
+            return max(minimum, float(raw))
+        except (TypeError, ValueError):
+            return default
+
+    def _slack_context_lookback_messages(self) -> int:
+        """Number of Slack history entries to fetch for channel gap context.
+
+        The value includes the triggering message when Slack returns it, so the
+        visible prior-message context is usually one fewer than this value.
+        """
+        return self._slack_int_extra("context_lookback_messages", 10, minimum=1)
+
+    def _slack_human_context_enabled(self) -> bool:
+        # Keep the behavior opt-in: tuning subordinate knobs should not change
+        # legacy Slack routing/context behavior unless the feature itself is on.
+        return self._slack_bool_value(self.config.extra.get("human_context_enabled"), default=False)
+
+    def _slack_event_packet_enabled(self) -> bool:
+        """Whether to prepend a structured Slack event packet for human context mode."""
+        return self._slack_bool_value(self.config.extra.get("event_packet_enabled"), default=True)
+
+    def _slack_attention_window_seconds(self) -> float:
+        minutes = self._slack_float_extra("attention_window_minutes", 5.0, minimum=0.0)
+        return minutes * 60.0
+
+    def _slack_surface_key(
+        self, channel_id: str, *, is_thread_reply: bool, thread_ts: Optional[str], is_dm: bool
+    ) -> Tuple[str, str, Optional[str]]:
+        if is_dm:
+            return ("dm", channel_id, thread_ts or None)
+        if is_thread_reply and thread_ts:
+            return ("thread", channel_id, thread_ts)
+        return ("channel", channel_id, None)
+
+    def _slack_attention_active(self, key: Tuple[str, str, Optional[str]]) -> bool:
+        expiry = self._slack_attention_until.get(key)
+        if not expiry:
+            return False
+        if time.monotonic() <= expiry:
+            return True
+        self._slack_attention_until.pop(key, None)
+        self._slack_attention_thread_ts.pop(key, None)
+        return False
+
+    def _activate_slack_attention(self, key: Tuple[str, str, Optional[str]], *, thread_ts: Optional[str] = None) -> None:
+        seconds = self._slack_attention_window_seconds()
+        if seconds <= 0:
+            return
+        self._slack_attention_until[key] = time.monotonic() + seconds
+        if thread_ts:
+            self._slack_attention_thread_ts[key] = thread_ts
+
+    @staticmethod
+    def _slack_response_messages(result: Any) -> List[Dict[str, Any]]:
+        """Return Slack response messages for dict-like Slack SDK responses."""
+        if not result or not hasattr(result, "get"):
+            return []
+        messages = result.get("messages", [])
+        if inspect.isawaitable(messages):
+            close = getattr(messages, "close", None)
+            if callable(close):
+                close()
+            return []
+        return messages if isinstance(messages, list) else []
+
+    def _strip_slack_route_directives(self, content: str) -> Tuple[str, Optional[str], bool]:
+        """Strip Slack-only routing/no-reply directives from agent output."""
+        if not content:
+            return content, None, False
+        route: Optional[str] = None
+        no_reply = False
+
+        def route_repl(match: re.Match) -> str:
+            nonlocal route
+            mode = (match.group(1) or "").lower()
+            if mode in {"channel", "thread"}:
+                route = mode
+            return ""
+
+        content = re.sub(
+            r"(?is)<slack_route\b[^>]*\bmode=[\"']?(channel|thread)[\"']?[^>]*/?>\s*",
+            route_repl,
+            content,
+            count=1,
+        )
+        if re.search(r"(?is)^\s*<slack_no_reply\b[^>]*/?>\s*$", content):
+            no_reply = True
+            content = ""
+        return content.strip(), route, no_reply
 
     def _resolve_thread_ts(
         self,
@@ -1961,6 +2093,18 @@ class SlackAdapter(BasePlatformAdapter):
         is_mentioned = bot_uid and f"<@{bot_uid}>" in routing_text
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
+        surface_key = self._slack_surface_key(
+            channel_id,
+            is_thread_reply=is_thread_reply,
+            thread_ts=event_thread_ts,
+            is_dm=is_dm,
+        )
+        passive_followup = False
+
+        human_context_enabled = self._slack_human_context_enabled()
+
+        if human_context_enabled and is_mentioned and not is_dm and not self._slack_strict_mention():
+            self._activate_slack_attention(surface_key, thread_ts=thread_ts)
 
         if not is_dm and bot_uid:
             # Check allowed channels — if set, only respond in these channels (whitelist)
@@ -1991,7 +2135,12 @@ class SlackAdapter(BasePlatformAdapter):
                         user_id=user_id,
                     )
                 )
-                if not reply_to_bot_thread and not in_mentioned_thread and not has_session:
+                attention_active = human_context_enabled and self._slack_attention_active(surface_key)
+                if attention_active:
+                    passive_followup = True
+                    if not is_thread_reply:
+                        thread_ts = self._slack_attention_thread_ts.get(surface_key) or thread_ts
+                if not attention_active and not reply_to_bot_thread and not in_mentioned_thread and not has_session:
                     return
 
         if is_mentioned:
@@ -2008,13 +2157,22 @@ class SlackAdapter(BasePlatformAdapter):
                     for t in to_remove:
                         self._mentioned_threads.discard(t)
 
-        # When entering a thread for the first time (no existing session),
-        # fetch thread context so the agent understands the conversation.
-        if is_thread_reply and not self._has_active_session_for_thread(
+        # When entering a thread for the first time, fetch thread context so the
+        # agent understands the conversation. In human context mode, the
+        # per-surface last-seen marker is the source of truth: no marker means
+        # the agent has not received this thread surface yet, even if a Hermes
+        # session exists for historical reasons. Legacy mode keeps the previous
+        # active-session guard for backwards compatibility.
+        has_thread_session = self._has_active_session_for_thread(
             channel_id=channel_id,
             thread_ts=event_thread_ts,
             user_id=user_id,
-        ):
+        ) if is_thread_reply else False
+        should_fetch_full_thread = is_thread_reply and (
+            (human_context_enabled and surface_key not in self._slack_context_last_seen)
+            or (not human_context_enabled and not has_thread_session)
+        )
+        if should_fetch_full_thread:
             thread_context = await self._fetch_thread_context(
                 channel_id=channel_id,
                 thread_ts=event_thread_ts,
@@ -2023,6 +2181,44 @@ class SlackAdapter(BasePlatformAdapter):
             )
             if thread_context:
                 text = thread_context + text
+        elif human_context_enabled and is_thread_reply:
+            thread_gap_context = await self._fetch_thread_gap_context(
+                channel_id=channel_id,
+                thread_ts=event_thread_ts,
+                current_ts=ts,
+                team_id=team_id,
+                surface_key=surface_key,
+            )
+            if thread_gap_context:
+                text = thread_gap_context + text
+
+        # For top-level channel mentions/passive follow-ups, fill the gap from
+        # the last context injection rather than repeatedly including already
+        # seen channel history. DMs/group DMs are always delivered but do not
+        # fetch channel history.
+        if human_context_enabled and not is_dm and not is_thread_reply:
+            channel_context = await self._fetch_channel_gap_context(
+                channel_id=channel_id,
+                current_ts=ts,
+                team_id=team_id,
+                surface_key=surface_key,
+            )
+            if channel_context:
+                text = channel_context + text
+
+        if human_context_enabled and self._slack_event_packet_enabled():
+            event_packet = self._format_slack_event_packet(
+                channel_id=channel_id,
+                surface_key=surface_key,
+                is_dm=is_dm,
+                is_mentioned=bool(is_mentioned),
+                passive_followup=passive_followup,
+                current_ts=ts,
+            )
+            text = event_packet + (text or "")
+        if human_context_enabled:
+            if ts:
+                self._slack_context_last_seen[surface_key] = ts
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -2204,7 +2400,7 @@ class SlackAdapter(BasePlatformAdapter):
         # already in the session history. Uses the thread-context cache when
         # available to avoid redundant conversations.replies calls.
         reply_to_text = None
-        if thread_ts and thread_ts != ts:
+        if is_thread_reply and thread_ts and thread_ts != ts:
             try:
                 reply_to_text = await self._fetch_thread_parent_text(
                     channel_id=channel_id,
@@ -2574,7 +2770,153 @@ class SlackAdapter(BasePlatformAdapter):
 
         # (approval state already consumed by atomic pop above)
 
-    # ----- Thread context fetching -----
+    # ----- Slack context fetching -----
+
+    async def _fetch_channel_gap_context(
+        self,
+        *,
+        channel_id: str,
+        current_ts: str,
+        team_id: str,
+        surface_key: Tuple[str, str, Optional[str]],
+    ) -> str:
+        """Fetch recent top-level channel messages not yet injected.
+
+        This is intentionally channel-only. Threads use conversations.replies
+        via _fetch_thread_context so we do not mix thread replies into the
+        top-level channel stream.
+        """
+        limit = self._slack_context_lookback_messages()
+        if limit <= 1:
+            return ""
+        last_seen = self._slack_context_last_seen.get(surface_key)
+        try:
+            kwargs: Dict[str, Any] = {
+                "channel": channel_id,
+                "limit": limit,
+                "inclusive": False,
+            }
+            if last_seen:
+                kwargs["oldest"] = last_seen
+            result = await self._get_client(channel_id).conversations_history(**kwargs)
+            messages = self._slack_response_messages(result)
+        except Exception as e:
+            logger.debug("[Slack] Failed to fetch channel gap context: %s", e)
+            return ""
+
+        context_messages = []
+        for msg in messages:
+            msg_ts = msg.get("ts", "")
+            if not msg_ts or msg_ts == current_ts:
+                continue
+            if last_seen and msg_ts <= last_seen:
+                continue
+            # conversations.history returns top-level messages, but defensive:
+            if msg.get("thread_ts") and msg.get("thread_ts") != msg_ts:
+                continue
+            text = (msg.get("text") or "").strip()
+            if not text:
+                continue
+            bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+            if bot_uid:
+                text = text.replace(f"<@{bot_uid}>", "").strip()
+            if not text:
+                continue
+            user = msg.get("user") or msg.get("username") or msg.get("bot_id") or "unknown"
+            name = await self._resolve_user_name(user, chat_id=channel_id)
+            context_messages.append((msg_ts, f"{name}: {text}"))
+
+        # Slack returns newest-first; show context in reading order and cap to
+        # the number of prior messages implied by the configured history window.
+        max_prior = max(0, limit - 1)
+        context_messages = sorted(context_messages, key=lambda item: item[0])[-max_prior:]
+        if not context_messages:
+            return ""
+        return (
+            "[Recent channel context — messages since you last saw this Slack surface:]\n"
+            + "\n".join(line for _ts, line in context_messages)
+            + "\n[End of recent channel context]\n\n"
+        )
+
+    async def _fetch_thread_gap_context(
+        self,
+        *,
+        channel_id: str,
+        thread_ts: str,
+        current_ts: str,
+        team_id: str,
+        surface_key: Tuple[str, str, Optional[str]],
+    ) -> str:
+        """Fetch thread replies after the last injected timestamp."""
+        last_seen = self._slack_context_last_seen.get(surface_key)
+        if not last_seen:
+            return ""
+        limit = self._slack_int_extra("thread_gap_messages", 50, minimum=1)
+        try:
+            result = await self._get_client(channel_id).conversations_replies(
+                channel=channel_id,
+                ts=thread_ts,
+                oldest=last_seen,
+                inclusive=False,
+                limit=limit,
+            )
+            messages = self._slack_response_messages(result)
+        except Exception as e:
+            logger.debug("[Slack] Failed to fetch thread gap context: %s", e)
+            return ""
+
+        bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+        parts = []
+        for msg in messages:
+            msg_ts = msg.get("ts", "")
+            if not msg_ts or msg_ts == current_ts or msg_ts <= last_seen:
+                continue
+            text = (msg.get("text") or "").strip()
+            if not text:
+                continue
+            if bot_uid:
+                text = text.replace(f"<@{bot_uid}>", "").strip()
+            if not text:
+                continue
+            user = msg.get("user") or msg.get("username") or msg.get("bot_id") or "unknown"
+            name = await self._resolve_user_name(user, chat_id=channel_id)
+            parts.append((msg_ts, f"{name}: {text}"))
+        parts = sorted(parts, key=lambda item: item[0])
+        if not parts:
+            return ""
+        return (
+            "[Thread context — new messages since you last saw this Slack thread:]\n"
+            + "\n".join(line for _ts, line in parts)
+            + "\n[End of thread context]\n\n"
+        )
+
+    def _format_slack_event_packet(
+        self,
+        *,
+        channel_id: str,
+        surface_key: Tuple[str, str, Optional[str]],
+        is_dm: bool,
+        is_mentioned: bool,
+        passive_followup: bool,
+        current_ts: str,
+    ) -> str:
+        surface_kind = surface_key[0]
+        attention_expiry = self._slack_attention_until.get(surface_key)
+        expires_in = 0
+        if attention_expiry:
+            expires_in = max(0, int(attention_expiry - time.monotonic()))
+        return (
+            "[Slack event]\n"
+            f"surface_kind: {surface_kind}\n"
+            f"channel_id: {channel_id}\n"
+            f"thread_ts: {surface_key[2] or 'none'}\n"
+            f"agent_was_mentioned: {str(bool(is_mentioned)).lower()}\n"
+            f"passive_followup: {str(bool(passive_followup)).lower()}\n"
+            f"dm_or_group_dm: {str(bool(is_dm)).lower()}\n"
+            f"attention_expires_in_seconds: {expires_in}\n"
+            f"message_ts: {current_ts}\n"
+            "[End Slack event]\n\n"
+        )
 
     async def _fetch_thread_context(
         self, channel_id: str, thread_ts: str, current_ts: str,
@@ -2637,6 +2979,8 @@ class SlackAdapter(BasePlatformAdapter):
                 return ""
 
             messages = result.get("messages", [])
+            if not isinstance(messages, list):
+                return ""
             if not messages:
                 return ""
 
