@@ -573,6 +573,44 @@ class TestSendDocument:
         assert call_kwargs["thread_ts"] == "1234567890.123456"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("chat_id", ["D123", "G123"])
+    async def test_top_level_dm_reply_not_threaded_when_dm_threads_disabled(self, adapter, chat_id):
+        adapter.config.extra["dm_top_level_threads_as_sessions"] = False
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "bot_ts"})
+
+        result = await adapter.send(
+            chat_id=chat_id,
+            content="hello",
+            reply_to="1234567890.123456",
+            metadata={"chat_type": "dm"},
+        )
+
+        assert result.success
+        call_args = adapter._app.client.chat_postMessage.await_args
+        assert call_args is not None
+        call_kwargs = call_args.kwargs
+        assert call_kwargs["channel"] == chat_id
+        assert "thread_ts" not in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_real_dm_thread_still_threaded_when_dm_threads_disabled(self, adapter):
+        adapter.config.extra["dm_top_level_threads_as_sessions"] = False
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "bot_ts"})
+
+        result = await adapter.send(
+            chat_id="D123",
+            content="hello",
+            reply_to="child_ts",
+            metadata={"chat_type": "dm", "thread_id": "parent_ts"},
+        )
+
+        assert result.success
+        call_args = adapter._app.client.chat_postMessage.await_args
+        assert call_args is not None
+        call_kwargs = call_args.kwargs
+        assert call_kwargs["thread_ts"] == "parent_ts"
+
+    @pytest.mark.asyncio
     async def test_send_document_thread_upload_marks_bot_participation(self, adapter, tmp_path):
         test_file = tmp_path / "notes.txt"
         test_file.write_bytes(b"some notes")
@@ -776,6 +814,48 @@ class TestBangPrefixCommands:
         msg_event = adapter.handle_message.call_args[0][0]
         assert msg_event.text.startswith("/queue")
         assert msg_event.message_type == MessageType.COMMAND
+
+
+class TestSlackThreadContextRouting:
+    """Regression coverage for injecting Slack thread history into replies."""
+
+    @pytest.mark.asyncio
+    async def test_mention_in_existing_thread_fetches_context(self, adapter):
+        """Even with an existing Hermes session, an explicit thread mention
+        should refresh Slack thread context so unmentioned intervening replies
+        are visible to the agent.
+        """
+        adapter._team_bot_user_ids = {"T123": "U_BOT"}
+        adapter._user_name_cache = {"U_USER": "Alice"}
+        adapter._fetch_thread_context = AsyncMock(
+            return_value="[Thread context — prior messages in this thread:]\nAlice: earlier unmentioned reply\n[End of thread context]\n\n"
+        )
+        adapter._fetch_thread_parent_text = AsyncMock(return_value="thread parent")
+
+        event = {
+            "text": "<@U_BOT> can you respond with the context?",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "team": "T123",
+            "ts": "1234567890.000003",
+            "thread_ts": "1234567890.000001",
+        }
+
+        with patch.object(adapter, "_has_active_session_for_thread", return_value=True):
+            await adapter._handle_slack_message(event)
+
+        adapter._fetch_thread_context.assert_awaited_once_with(
+            channel_id="C123",
+            thread_ts="1234567890.000001",
+            current_ts="1234567890.000003",
+            team_id="T123",
+        )
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text.startswith("[Thread context")
+        assert "earlier unmentioned reply" in msg_event.text
+        assert "can you respond with the context?" in msg_event.text
+        assert "<@U_BOT>" not in msg_event.text
 
 
 # ---------------------------------------------------------------------------

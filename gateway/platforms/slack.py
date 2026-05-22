@@ -1105,6 +1105,24 @@ class SlackAdapter(BasePlatformAdapter):
         thread replies.  Messages that originate inside an existing thread are
         always replied to in-thread to preserve conversation context.
         """
+        md = metadata or {}
+
+        # Top-level Slack DMs can be configured as a single continuous Hermes
+        # session (``dm_top_level_threads_as_sessions=false``).  In that mode
+        # the gateway still passes ``reply_to`` as the triggering message id for
+        # platforms that need native replies, but Slack would interpret that as
+        # "post the assistant response in a new thread".  If there is no real
+        # thread metadata, suppress the fallback-to-reply_to for DM/MPIM events
+        # so the response lands at the top level of the DM instead.  Real Slack
+        # thread replies still carry metadata.thread_id/thread_ts and remain
+        # threaded below.
+        if (
+            str(md.get("chat_type") or "").lower() == "dm"
+            and not self._dm_top_level_threads_as_sessions()
+            and not (md.get("thread_id") or md.get("thread_ts"))
+        ):
+            return None
+
         # When reply_in_thread is disabled (default: True for backward compat),
         # only thread messages that are already part of an existing thread.
         # For top-level channel messages, the inbound handler sets
@@ -1115,7 +1133,6 @@ class SlackAdapter(BasePlatformAdapter):
         # when thread_id == reply_to the "thread" is synthetic and we reply
         # directly in the channel instead.
         if not self.config.extra.get("reply_in_thread", True):
-            md = metadata or {}
             existing_thread = md.get("thread_id") or md.get("thread_ts")
             if existing_thread and reply_to and existing_thread == reply_to:
                 existing_thread = None
@@ -2157,12 +2174,12 @@ class SlackAdapter(BasePlatformAdapter):
                     for t in to_remove:
                         self._mentioned_threads.discard(t)
 
-        # When entering a thread for the first time, fetch thread context so the
-        # agent understands the conversation. In human context mode, the
-        # per-surface last-seen marker is the source of truth: no marker means
-        # the agent has not received this thread surface yet, even if a Hermes
-        # session exists for historical reasons. Legacy mode keeps the previous
-        # active-session guard for backwards compatibility.
+        # Fetch Slack thread context when the bot is entering a thread. In
+        # human-context mode the per-surface last-seen marker is the source of
+        # truth: no marker means the agent has not received this Slack thread
+        # surface yet, even if a Hermes session exists. Legacy mode preserves
+        # the existing mention-refresh behavior because intervening unmentioned
+        # thread replies may not have been routed through Hermes.
         has_thread_session = self._has_active_session_for_thread(
             channel_id=channel_id,
             thread_ts=event_thread_ts,
@@ -2170,7 +2187,7 @@ class SlackAdapter(BasePlatformAdapter):
         ) if is_thread_reply else False
         should_fetch_full_thread = is_thread_reply and (
             (human_context_enabled and surface_key not in self._slack_context_last_seen)
-            or (not human_context_enabled and not has_thread_session)
+            or (not human_context_enabled and (is_mentioned or not has_thread_session))
         )
         if should_fetch_full_thread:
             thread_context = await self._fetch_thread_context(

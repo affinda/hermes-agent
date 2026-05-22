@@ -13485,8 +13485,20 @@ class GatewayRunner:
         """Build the metadata dict platforms need for thread-aware replies."""
         thread_id = getattr(source, "thread_id", None)
         if thread_id is None:
+            if (
+                getattr(source, "platform", None) == Platform.SLACK
+                and getattr(source, "chat_type", None) == "dm"
+            ):
+                # Slack top-level DM/MPIM turns may still pass a reply anchor
+                # (the triggering message id) through the generic gateway send
+                # path.  Preserve the chat type in metadata so the Slack
+                # adapter can distinguish "reply to the DM at top level" from
+                # "reply inside a real Slack thread".
+                return {"chat_type": "dm"}
             return None
         metadata: Dict[str, Any] = {"thread_id": thread_id}
+        if getattr(source, "platform", None) == Platform.SLACK:
+            metadata["chat_type"] = getattr(source, "chat_type", None) or ""
         if (
             getattr(source, "platform", None) == Platform.TELEGRAM
             and getattr(source, "chat_type", None) == "dm"
