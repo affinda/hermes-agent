@@ -19,17 +19,30 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any, Tuple, List
 
+aiohttp: Any
+
 try:
     from slack_bolt.async_app import AsyncApp
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
     from slack_sdk.web.async_client import AsyncWebClient
-    import aiohttp
+    import aiohttp as _aiohttp
+    aiohttp = _aiohttp
     SLACK_AVAILABLE = True
 except ImportError:
     SLACK_AVAILABLE = False
     AsyncApp = Any
     AsyncSocketModeHandler = Any
     AsyncWebClient = Any
+    class _MissingAiohttp:
+        class ClientTimeout:  # pragma: no cover - only used when deps are absent
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+        class ClientSession:  # pragma: no cover - patched in tests or unused
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                raise ImportError("aiohttp is required for Slack response_url posts")
+
+    aiohttp = _MissingAiohttp
 
 import sys
 from pathlib import Path as _Path

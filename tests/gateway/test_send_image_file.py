@@ -57,6 +57,29 @@ class TestExtractMediaImages:
         assert "/audio.ogg" in paths
         assert "/screenshot.png" in paths
 
+    def test_generic_artifact_extensions_extracted(self):
+        content = (
+            "Generated artifacts:\n"
+            "MEDIA:/tmp/agent-report.json\n"
+            "MEDIA:/tmp/error-summary.log\n"
+            "MEDIA:/tmp/preview.html"
+        )
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+
+        assert [path for path, _is_voice in media] == [
+            "/tmp/agent-report.json",
+            "/tmp/error-summary.log",
+            "/tmp/preview.html",
+        ]
+        assert "MEDIA:" not in cleaned
+
+    def test_quoted_artifact_path_with_spaces_extracted(self):
+        content = 'Here is the report: MEDIA:"/tmp/nightly context report.yaml"'
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+
+        assert media == [("/tmp/nightly context report.yaml", False)]
+        assert "MEDIA:" not in cleaned
+
 
 # ---------------------------------------------------------------------------
 # Telegram send_image_file tests
@@ -357,6 +380,26 @@ class TestSlackSendImageFile:
         )
         assert not result.success
         assert "Not connected" in result.error
+
+    def test_send_document_uploads_generic_artifact(self, adapter, tmp_path):
+        """Generic MEDIA: artifacts route through Slack native file upload."""
+        report = tmp_path / "agent-report.json"
+        report.write_text('{"ok": true}\n')
+
+        mock_result = MagicMock()
+        adapter._app.client.files_upload_v2 = AsyncMock(return_value=mock_result)
+
+        result = _run(
+            adapter.send_document(chat_id="C12345", file_path=str(report), caption="Report")
+        )
+
+        assert result.success
+        adapter._app.client.files_upload_v2.assert_awaited_once()
+        call_kwargs = adapter._app.client.files_upload_v2.call_args.kwargs
+        assert call_kwargs["channel"] == "C12345"
+        assert call_kwargs["file"] == str(report)
+        assert call_kwargs["filename"] == "agent-report.json"
+        assert call_kwargs["initial_comment"] == "Report"
 
 
 # ---------------------------------------------------------------------------

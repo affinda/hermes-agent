@@ -2296,9 +2296,13 @@ class BasePlatformAdapter(ABC):
         cleaned = cleaned.replace("[[as_document]]", "")
         
         # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
-        # and quoted/backticked paths for LLM-formatted outputs.
+        # and quoted/backticked paths for LLM-formatted outputs. Keep the
+        # extension list intentionally broad so agents can emit arbitrary local
+        # artifacts (reports, logs, JSON/YAML payloads, HTML previews, archives,
+        # mobile builds, etc.) and let the gateway upload them natively instead
+        # of forcing users/skills back through platform-specific Web APIs.
         media_pattern = re.compile(
-            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?'''
+            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|bmp|tiff?|svg|mp4|mov|avi|mkv|webm|3gp|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|tar|gz|tgz|bz2|xz|rar|7z|docx?|odt|rtf|xlsx?|ods|pptx?|odp|key|txt|md|log|csv|tsv|json|ya?ml|xml|html?|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?'''
         )
         for match in media_pattern.finditer(content):
             path = match.group("path").strip()

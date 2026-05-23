@@ -453,9 +453,11 @@ PLATFORM_HINTS = {
     "slack": (
         "You are in a Slack workspace communicating with your user. "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
-        "in your response. Images (.png, .jpg, .webp) are uploaded as photo "
-        "attachments, audio as file attachments. You can also include image URLs "
-        "in markdown format ![alt](url) and they will be uploaded as attachments."
+        "in your response. The gateway uploads matching local files to Slack "
+        "as native attachments: images (.png, .jpg, .webp) are photo "
+        "attachments, audio/video/documents/reports/logs/archives are file "
+        "attachments. You can also include image URLs in markdown format "
+        "![alt](url) and they will be uploaded as attachments."
     ),
     "signal": (
         "You are on a text messaging communication platform, Signal. "
