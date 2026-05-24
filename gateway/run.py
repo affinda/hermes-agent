@@ -954,6 +954,14 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+class SessionInboxTargetBusy(RuntimeError):
+    """Raised when a durable inbox event targets a session with an active turn.
+
+    This is a normal backpressure signal, not a delivery failure.  The watcher
+    must keep the event queued until the target conversation becomes idle.
+    """
+
+
 # Sentinel placed into _running_agents immediately when a session starts
 # processing, *before* any await.  Prevents a second message for the same
 # session from bypassing the "already running" guard during the async gap
@@ -2942,7 +2950,7 @@ class GatewayRunner:
         # creating a session.  The busy path must enforce the same check;
         # otherwise unauthorized users in shared threads (Slack/Telegram/Discord)
         # can inject messages into an active session they don't own.
-        if not self._is_user_authorized(event.source):
+        if not bool(getattr(event, "internal", False)) and not self._is_user_authorized(event.source):
             logger.warning(
                 "Dropping message from unauthorized user in active session: "
                 "user=%s (%s), platform=%s, session=%s",
@@ -4214,6 +4222,11 @@ class GatewayRunner:
         # turn so the agent kicks off the new chat.
         asyncio.create_task(self._handoff_watcher())
 
+        # Start background session inbox watcher — picks up trusted internal
+        # events from external producers and injects them as synthetic turns
+        # into the target gateway session.
+        asyncio.create_task(self._session_inbox_watcher())
+
         logger.info("Press Ctrl+C to stop")
         
         return True
@@ -4267,6 +4280,172 @@ class GatewayRunner:
             except Exception as exc:
                 logger.debug("Handoff watcher tick error: %s", exc, exc_info=True)
             await asyncio.sleep(interval)
+
+    async def _session_inbox_watcher(self, interval: float = 2.0) -> None:
+        """Background task that dispatches trusted internal session events.
+
+        Producers enqueue rows in ``session_inbox_events`` (via CLI/API/etc.).
+        The gateway claims each ready row and turns it into a synthetic
+        ``MessageEvent(internal=True)`` so normal session context, busy-queue,
+        transcript persistence, and platform rendering all stay centralized.
+        """
+        await asyncio.sleep(5)
+        while self._running:
+            try:
+                if self._session_db is None:
+                    await asyncio.sleep(interval)
+                    continue
+                pending = self._session_db.list_queued_session_inbox_events(limit=20)
+                for row in pending:
+                    event_id = row.get("id")
+                    if not event_id:
+                        continue
+                    if not self._session_db.claim_session_inbox_event(event_id, lease_seconds=21600):
+                        continue
+                    claimed = self._session_db.get_session_inbox_event(event_id) or row
+                    try:
+                        await self._process_session_inbox_event(claimed)
+                        self._session_db.complete_session_inbox_event(event_id)
+                    except SessionInboxTargetBusy as exc:
+                        # The target Hermes conversation is still processing the turn
+                        # that likely spawned this callback.  Keep the event durable and
+                        # queued indefinitely; busy backpressure is not a delivery failure
+                        # and must not exhaust the normal retry budget.
+                        logger.info(
+                            "Session inbox event %s deferred: %s",
+                            event_id, exc,
+                        )
+                        self._session_db.fail_session_inbox_event(
+                            event_id,
+                            str(exc),
+                            retry=True,
+                            backoff_seconds=10,
+                        )
+                    except Exception as exc:
+                        attempts = int((claimed or {}).get("attempts") or 0)
+                        retry = attempts < 5
+                        backoff = min(300, 5 * (2 ** max(attempts, 0)))
+                        logger.warning(
+                            "Session inbox event %s failed (retry=%s): %s",
+                            event_id, retry, exc, exc_info=True,
+                        )
+                        self._session_db.fail_session_inbox_event(
+                            event_id,
+                            str(exc),
+                            retry=retry,
+                            backoff_seconds=backoff,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("Session inbox watcher tick error: %s", exc, exc_info=True)
+            await asyncio.sleep(interval)
+
+    def _resolve_session_inbox_source(self, event_row: Dict[str, Any]) -> tuple[SessionSource, str]:
+        """Resolve a queued inbox event to a SessionSource and session_key."""
+        source_data = event_row.get("source_json")
+        source: Optional[SessionSource] = None
+        if isinstance(source_data, dict):
+            try:
+                source = SessionSource.from_dict(source_data)
+            except Exception as exc:
+                raise RuntimeError(f"invalid source_json: {exc}") from exc
+
+        target_key = (event_row.get("target_session_key") or "").strip() or None
+        target_session_id = (event_row.get("target_session_id") or "").strip() or None
+
+        entry = None
+        if target_key:
+            try:
+                entry = self.session_store.get_entry(target_key)
+            except Exception:
+                entry = None
+            if entry and entry.origin:
+                source = entry.origin
+
+        if source is None and target_session_id:
+            try:
+                entry = self.session_store.find_entry_by_session_id(target_session_id)
+            except Exception:
+                entry = None
+            if entry and entry.origin:
+                source = entry.origin
+                target_key = entry.session_key
+
+        if source is None:
+            raise RuntimeError(
+                "could not resolve target source; provide source_json or an active target session mapping"
+            )
+
+        session_key = self._session_key_for_source(source)
+        if target_key and target_key != session_key:
+            if entry is None or entry.session_key != target_key:
+                raise RuntimeError(
+                    f"target_session_key {target_key!r} does not match resolved source key {session_key!r}"
+                )
+            session_key = target_key
+
+        return source, session_key
+
+    async def _process_session_inbox_event(self, event_row: Dict[str, Any]) -> None:
+        """Dispatch one durable internal event into its target Hermes session."""
+        source, session_key = self._resolve_session_inbox_source(event_row)
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            platform_name = source.platform.value if source.platform else "unknown"
+            raise RuntimeError(f"platform '{platform_name}' is not active in this gateway")
+
+        entry = self.session_store.get_or_create_session(source)
+        target_session_id = (event_row.get("target_session_id") or "").strip() or None
+        if target_session_id and entry.session_id != target_session_id:
+            switched = self.session_store.switch_session(session_key, target_session_id)
+            if switched is None:
+                raise RuntimeError(
+                    f"could not switch session key {session_key} → {target_session_id}"
+                )
+            self._evict_cached_agent(session_key)
+
+        metadata = event_row.get("metadata") if isinstance(event_row.get("metadata"), dict) else {}
+        raw_message = {
+            "session_inbox_event_id": event_row.get("id"),
+            "source": event_row.get("source"),
+            "kind": event_row.get("kind"),
+            "metadata": metadata,
+        }
+        synthetic_event = MessageEvent(
+            text=str(event_row.get("text") or ""),
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=raw_message,
+            internal=True,
+        )
+
+        logger.info(
+            "Session inbox: dispatching event %s source=%s kind=%s session=%s key=%s",
+            event_row.get("id"), event_row.get("source"), event_row.get("kind"),
+            target_session_id or entry.session_id, session_key,
+        )
+        response_text = event_row.get("response_text")
+        if not response_text:
+            if session_key in getattr(self, "_running_agents", {}):
+                raise SessionInboxTargetBusy("target session is busy; retrying later")
+            response_text = await self._handle_message(synthetic_event)
+            if response_text and self._session_db is not None and event_row.get("id"):
+                self._session_db.mark_session_inbox_event_response_ready(
+                    str(event_row["id"]),
+                    str(response_text),
+                )
+        if not response_text:
+            return
+        send_metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(synthetic_event))
+        result = await adapter.send(
+            chat_id=str(source.chat_id),
+            content=response_text,
+            metadata=send_metadata,
+        )
+        if not getattr(result, "success", True):
+            err = getattr(result, "error", "send returned success=False")
+            raise RuntimeError(f"adapter.send failed: {err}")
 
     async def _process_handoff(self, row: Dict[str, Any]) -> None:
         """Execute one handoff row. Raises on failure (caller marks failed)."""

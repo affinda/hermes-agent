@@ -1234,6 +1234,22 @@ class SessionStore:
 
         return new_entry
 
+    def get_entry(self, session_key: str) -> Optional[SessionEntry]:
+        """Return a session-store entry by key, if present."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            return self._entries.get(session_key)
+
+    def find_entry_by_session_id(self, session_id: str) -> Optional[SessionEntry]:
+        """Return the most recently updated entry currently bound to a session ID."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            matches = [e for e in self._entries.values() if e.session_id == session_id]
+        if not matches:
+            return None
+        matches.sort(key=lambda e: e.updated_at, reverse=True)
+        return matches[0]
+
     def list_sessions(self, active_minutes: Optional[int] = None) -> List[SessionEntry]:
         """List all sessions, optionally filtered by activity."""
         with self._lock:

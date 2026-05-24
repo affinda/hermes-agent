@@ -12959,6 +12959,31 @@ Examples:
         "--limit", type=int, default=500, help="Max sessions to load (default: 500)"
     )
 
+    sessions_inject = sessions_subparsers.add_parser(
+        "inject",
+        help="Queue a trusted internal turn for an existing gateway session",
+        description=(
+            "Enqueue a session inbox event. A running gateway will claim it and "
+            "dispatch it as MessageEvent(internal=True). Provide either a "
+            "--session-id/--session-key that maps to an active gateway session, "
+            "or --source-json with a serialized SessionSource."
+        ),
+    )
+    sessions_inject.add_argument("--session-id", dest="target_session_id", help="Target Hermes session ID")
+    sessions_inject.add_argument("--session-key", dest="target_session_key", help="Target gateway session key")
+    sessions_inject.add_argument("--source", default="external", help="Producer name (default: external)")
+    sessions_inject.add_argument("--kind", default="message", help="Event kind (default: message)")
+    sessions_inject.add_argument("--text", help="Synthetic user-turn text; omit to read stdin")
+    sessions_inject.add_argument("--metadata-json", help="Optional event metadata JSON object")
+    sessions_inject.add_argument("--source-json", help="Optional gateway SessionSource JSON object")
+    sessions_inject.add_argument("--idempotency-key", help="Deduplicate retried producer callbacks")
+    sessions_inject.add_argument(
+        "--delivery-mode",
+        default="model",
+        choices=["model"],
+        help="Dispatch behavior (default: model)",
+    )
+
     def _confirm_prompt(prompt: str) -> bool:
         """Prompt for y/N confirmation, safe against non-TTY environments."""
         try:
@@ -13087,6 +13112,48 @@ Examples:
                     print(f"Session '{args.session_id}' not found.")
             except ValueError as e:
                 print(f"Error: {e}")
+
+        elif action == "inject":
+            def _json_obj(raw: str | None, label: str):
+                if not raw:
+                    return None
+                try:
+                    parsed = _json.loads(raw)
+                except Exception as exc:
+                    raise ValueError(f"{label} must be valid JSON: {exc}") from exc
+                if not isinstance(parsed, dict):
+                    raise ValueError(f"{label} must be a JSON object")
+                return parsed
+
+            text = args.text
+            if text is None:
+                text = sys.stdin.read()
+            text = (text or "").strip()
+            if not text:
+                print("Error: --text or stdin content is required")
+                return
+            try:
+                metadata = _json_obj(getattr(args, "metadata_json", None), "--metadata-json")
+                source_json = _json_obj(getattr(args, "source_json", None), "--source-json")
+                event = db.enqueue_session_inbox_event(
+                    target_session_id=getattr(args, "target_session_id", None),
+                    target_session_key=getattr(args, "target_session_key", None),
+                    source=getattr(args, "source", "external"),
+                    kind=getattr(args, "kind", "message"),
+                    text=text,
+                    metadata=metadata,
+                    source_json=source_json,
+                    delivery_mode=getattr(args, "delivery_mode", "model"),
+                    idempotency_key=getattr(args, "idempotency_key", None),
+                )
+            except Exception as exc:
+                print(f"Error: Could not enqueue session inbox event: {exc}")
+                return
+            print(
+                "Queued session inbox event "
+                f"{event['id']} for "
+                f"{event.get('target_session_id') or event.get('target_session_key') or 'source-json target'}"
+            )
 
         elif action == "browse":
             limit = getattr(args, "limit", 500) or 500

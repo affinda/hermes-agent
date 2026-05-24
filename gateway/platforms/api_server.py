@@ -940,6 +940,85 @@ class APIServerAdapter(BasePlatformAdapter):
             "pid": os.getpid(),
         })
 
+    async def _handle_session_inbox_event(self, request: "web.Request") -> "web.Response":
+        """POST /v1/session_inbox_events — enqueue a trusted internal event.
+
+        This is the HTTP producer counterpart to ``hermes sessions inject``. It
+        lets trusted services such as the DevAgent control plane wake an
+        existing Hermes gateway session without shelling into the Hermes host
+        and without posting directly to Slack.
+        """
+        auth_error = self._check_auth(request)
+        if auth_error is not None:
+            return auth_error
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                _openai_error("Request body must be valid JSON.", code="invalid_json"),
+                status=400,
+            )
+
+        if not isinstance(body, dict):
+            return web.json_response(
+                _openai_error("Request body must be a JSON object.", code="invalid_request"),
+                status=400,
+            )
+
+        def _object_or_none(name: str) -> Optional[Dict[str, Any]]:
+            value = body.get(name)
+            if value is None:
+                return None
+            if not isinstance(value, dict):
+                raise TypeError(f"{name} must be a JSON object")
+            return value
+
+        try:
+            source_json = _object_or_none("source_json")
+            metadata = _object_or_none("metadata") or _object_or_none("metadata_json")
+            session_db = self._ensure_session_db()
+            if session_db is None:
+                return web.json_response(
+                    _openai_error("Session database unavailable.", code="session_db_unavailable"),
+                    status=503,
+                )
+            event = session_db.enqueue_session_inbox_event(
+                source=str(body.get("source") or "").strip(),
+                kind=str(body.get("kind") or body.get("type") or "").strip(),
+                text=str(body.get("text") or ""),
+                target_session_id=body.get("target_session_id") or body.get("session_id"),
+                target_session_key=body.get("target_session_key") or body.get("session_key"),
+                source_json=source_json,
+                metadata=metadata,
+                delivery_mode=str(body.get("delivery_mode") or "model"),
+                idempotency_key=(
+                    body.get("idempotency_key")
+                    or request.headers.get("Idempotency-Key")
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            return web.json_response(_openai_error(str(exc), code="invalid_request"), status=400)
+        except Exception as exc:
+            logger.exception("[api_server] failed to enqueue session inbox event")
+            return web.json_response(
+                _openai_error(f"Failed to enqueue session inbox event: {exc}", code="enqueue_failed"),
+                status=500,
+            )
+
+        return web.json_response(
+            {
+                "object": "hermes.session_inbox_event",
+                "id": event.get("id"),
+                "status": event.get("status"),
+                "target_session_id": event.get("target_session_id"),
+                "target_session_key": event.get("target_session_key"),
+                "source": event.get("source"),
+                "kind": event.get("kind"),
+            },
+            status=202,
+        )
+
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
         auth_err = self._check_auth(request)
@@ -1002,6 +1081,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
+                "session_inbox_events": True,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
@@ -1012,6 +1092,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "models": {"method": "GET", "path": "/v1/models"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
+                "session_inbox_events": {"method": "POST", "path": "/v1/session_inbox_events"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
@@ -3404,6 +3485,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
+            self._app.router.add_post("/v1/session_inbox_events", self._handle_session_inbox_event)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
             # Cron jobs management API
