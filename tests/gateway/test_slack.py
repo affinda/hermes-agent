@@ -72,7 +72,9 @@ from gateway.platforms.slack import SlackAdapter  # noqa: E402
 
 @pytest.fixture()
 def adapter():
-    config = PlatformConfig(enabled=True, token="xoxb-fake-token")
+    # Most adapter tests assert raw message text. Disable human-context packets
+    # in this shared fixture; dedicated tests cover the Affinda baked-in default.
+    config = PlatformConfig(enabled=True, token="***", extra={"human_context_enabled": False})
     a = SlackAdapter(config)
     # Mock the Slack app client
     a._app = MagicMock()
@@ -2073,7 +2075,7 @@ class TestThreadReplyHandling:
     @pytest.fixture()
     def adapter_with_session_store(self, mock_session_store):
         """Create an adapter with a mock session store attached."""
-        config = PlatformConfig(enabled=True, token="***")
+        config = PlatformConfig(enabled=True, token="***", extra={"human_context_enabled": False})
         a = SlackAdapter(config)
         a._app = MagicMock()
         a._app.client = AsyncMock()
@@ -2794,8 +2796,10 @@ class TestProgressMessageThread:
     """
 
     @pytest.mark.asyncio
-    async def test_dm_toplevel_progress_uses_message_ts_as_thread(self, adapter):
-        """Progress messages for a top-level DM should go into the reply thread."""
+    async def test_dm_toplevel_progress_uses_message_ts_as_thread_when_per_dm_threads_enabled(self, adapter):
+        """Progress messages thread under the user message when per-DM threads are enabled."""
+        adapter.config.extra["dm_top_level_threads_as_sessions"] = True
+
         # Simulate a top-level DM: no thread_ts in the event
         event = {
             "channel": "D_DM",
@@ -2846,10 +2850,21 @@ class TestProgressMessageThread:
             "ensuring progress messages land in the thread"
         )
 
+    def test_affinda_slack_context_defaults_are_baked_in(self):
+        """Affinda fork defaults enable human context and continuous top-level DMs."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="***"))
+        assert adapter._dm_top_level_threads_as_sessions() is False
+        assert adapter._slack_human_context_enabled() is True
+        assert adapter._slack_context_lookback_messages() == 20
+        assert adapter._slack_thread_gap_messages() == 20
+        assert adapter._slack_attention_window_seconds() == 300.0
+        assert adapter._slack_event_packet_enabled() is True
+        assert adapter.config.extra.get("reply_in_thread", True) is True
+        assert adapter.config.extra.get("reply_broadcast", False) is False
+
     @pytest.mark.asyncio
-    async def test_dm_toplevel_shares_session_when_disabled(self, adapter):
-        """Opting out restores legacy single-session-per-DM-channel behavior."""
-        adapter.config.extra["dm_top_level_threads_as_sessions"] = False
+    async def test_dm_toplevel_shares_session_by_default(self, adapter):
+        """Affinda default uses one continuous session per top-level DM channel."""
 
         event = {
             "channel": "D_DM",
@@ -3368,8 +3383,9 @@ class TestSlackHumanLikeContext:
         assert "U_BOB: dict-like response gap" in msg_event.text
 
     @pytest.mark.asyncio
-    async def test_human_context_requires_explicit_opt_in(self):
+    async def test_human_context_can_be_explicitly_disabled(self):
         config = PlatformConfig(enabled=True, token="***", extra={
+            "human_context_enabled": False,
             "context_lookback_messages": 3,
             "event_packet_enabled": False,
         })

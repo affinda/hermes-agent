@@ -980,15 +980,15 @@ class SlackAdapter(BasePlatformAdapter):
     def _dm_top_level_threads_as_sessions(self) -> bool:
         """Whether top-level Slack DMs get per-message session threads.
 
-        Defaults to ``True`` so each visible DM reply thread is isolated as its
-        own Hermes session — matching the per-thread behavior channels already
-        have.  Set ``platforms.slack.extra.dm_top_level_threads_as_sessions``
-        to ``false`` in config.yaml to revert to the legacy behavior where all
-        top-level DMs share one continuous session.
+        Defaults to ``False`` in the Affinda-managed branch so top-level DMs
+        share one continuous session by default.  Set
+        ``platforms.slack.extra.dm_top_level_threads_as_sessions`` to ``true``
+        in config.yaml when each visible DM reply thread should become its own
+        isolated Hermes session.
         """
         raw = self.config.extra.get("dm_top_level_threads_as_sessions")
         if raw is None:
-            return True  # default: each DM thread is its own session
+            return False  # Affinda default: one continuous top-level DM session
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
     @staticmethod
@@ -1023,12 +1023,10 @@ class SlackAdapter(BasePlatformAdapter):
         The value includes the triggering message when Slack returns it, so the
         visible prior-message context is usually one fewer than this value.
         """
-        return self._slack_int_extra("context_lookback_messages", 10, minimum=1)
+        return self._slack_int_extra("context_lookback_messages", 20, minimum=1)
 
     def _slack_human_context_enabled(self) -> bool:
-        # Keep the behavior opt-in: tuning subordinate knobs should not change
-        # legacy Slack routing/context behavior unless the feature itself is on.
-        return self._slack_bool_value(self.config.extra.get("human_context_enabled"), default=False)
+        return self._slack_bool_value(self.config.extra.get("human_context_enabled"), default=True)
 
     def _slack_event_packet_enabled(self) -> bool:
         """Whether to prepend a structured Slack event packet for human context mode."""
@@ -1037,6 +1035,10 @@ class SlackAdapter(BasePlatformAdapter):
     def _slack_attention_window_seconds(self) -> float:
         minutes = self._slack_float_extra("attention_window_minutes", 5.0, minimum=0.0)
         return minutes * 60.0
+
+    def _slack_thread_gap_messages(self) -> int:
+        """Number of Slack thread replies to fetch for human-context gap fills."""
+        return self._slack_int_extra("thread_gap_messages", 20, minimum=1)
 
     def _slack_surface_key(
         self, channel_id: str, *, is_thread_reply: bool, thread_ts: Optional[str], is_dm: bool
@@ -2881,7 +2883,7 @@ class SlackAdapter(BasePlatformAdapter):
         last_seen = self._slack_context_last_seen.get(surface_key)
         if not last_seen:
             return ""
-        limit = self._slack_int_extra("thread_gap_messages", 50, minimum=1)
+        limit = self._slack_thread_gap_messages()
         try:
             result = await self._get_client(channel_id).conversations_replies(
                 channel=channel_id,
