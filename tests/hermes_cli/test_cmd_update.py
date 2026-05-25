@@ -1,4 +1,4 @@
-"""Tests for cmd_update — branch fallback when remote branch doesn't exist."""
+"""Tests for cmd_update branch selection."""
 
 import subprocess
 from types import SimpleNamespace
@@ -39,12 +39,12 @@ def mock_args():
     return SimpleNamespace()
 
 
-class TestCmdUpdateBranchFallback:
-    """cmd_update falls back to main when current branch has no remote counterpart."""
+class TestCmdUpdateBranchSelection:
+    """cmd_update tracks the current branch for Affinda-managed installs."""
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_update_falls_back_to_main_when_branch_not_on_remote(
+    def test_update_uses_current_branch_even_when_branch_not_verified(
         self, mock_run, _mock_which, mock_args, capsys
     ):
         mock_run.side_effect = _make_run_side_effect(
@@ -55,16 +55,17 @@ class TestCmdUpdateBranchFallback:
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
 
-        # rev-list should use origin/main, not origin/fix/stoicneko
+        # Affinda-managed installs live on a fork branch; update must track the
+        # current branch instead of falling back to main and losing customizations.
         rev_list_cmds = [c for c in commands if "rev-list" in c]
         assert len(rev_list_cmds) == 1
-        assert "origin/main" in rev_list_cmds[0]
-        assert "origin/fix/stoicneko" not in rev_list_cmds[0]
+        assert "origin/fix/stoicneko" in rev_list_cmds[0]
+        assert "origin/main" not in rev_list_cmds[0]
 
-        # pull should use main, not fix/stoicneko
+        # pull should use the current branch, not main
         pull_cmds = [c for c in commands if "pull" in c]
         assert len(pull_cmds) == 1
-        assert "main" in pull_cmds[0]
+        assert "fix/stoicneko" in pull_cmds[0]
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")

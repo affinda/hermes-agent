@@ -127,7 +127,7 @@ _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
 # (e.g. nix-built hermes — no local git history to count against).
 UPDATE_AVAILABLE_NO_COUNT = -1
 
-_UPSTREAM_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
+_UPSTREAM_REPO_URL = "https://github.com/affinda/hermes-agent.git"
 
 
 def _check_via_rev(local_rev: str) -> Optional[int]:
@@ -151,8 +151,27 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     return 0 if upstream_rev == local_rev else UPDATE_AVAILABLE_NO_COUNT
 
 
+def _current_git_branch(repo_dir: Path) -> str:
+    """Return the current branch name, defaulting to main for detached HEAD."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=str(repo_dir),
+        )
+        if result.returncode == 0:
+            branch = (result.stdout or "").strip()
+            if branch and branch != "HEAD":
+                return branch
+    except Exception:
+        pass
+    return "main"
+
+
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
+    """Count commits behind the matching origin branch in a local checkout."""
     try:
         subprocess.run(
             ["git", "fetch", "origin", "--quiet"],
@@ -163,8 +182,9 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         pass  # Offline or timeout — use stale refs, that's fine
 
     try:
+        branch = _current_git_branch(repo_dir)
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..origin/{branch}"],
             capture_output=True, text=True, timeout=5,
             cwd=str(repo_dir),
         )
@@ -221,8 +241,9 @@ def check_for_updates() -> Optional[int]:
     """Check whether a Hermes update is available.
 
     Two paths: if ``HERMES_REVISION`` is set (nix builds embed it), compare
-    it to upstream main via ``git ls-remote``. Otherwise look for a local
-    git checkout and count commits behind ``origin/main``.
+    it to the managed distribution branch via ``git ls-remote``. Otherwise
+    look for a local git checkout and count commits behind the matching
+    ``origin/<current-branch>``.
 
     Returns the number of commits behind, ``UPDATE_AVAILABLE_NO_COUNT`` (-1)
     if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
@@ -305,7 +326,8 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     if repo_dir is None:
         return None
 
-    upstream = _git_short_hash(repo_dir, "origin/main")
+    branch = _current_git_branch(repo_dir)
+    upstream = _git_short_hash(repo_dir, f"origin/{branch}")
     local = _git_short_hash(repo_dir, "HEAD")
     if not upstream or not local:
         return None
@@ -313,7 +335,7 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     ahead = 0
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "origin/main..HEAD"],
+            ["git", "rev-list", "--count", f"origin/{branch}..HEAD"],
             capture_output=True,
             text=True,
             timeout=5,

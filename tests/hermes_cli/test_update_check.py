@@ -48,14 +48,20 @@ def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
     cache_file = tmp_path / ".update_check"
     cache_file.write_text(json.dumps({"ts": 0, "behind": 1}))
 
-    mock_result = MagicMock(returncode=0, stdout="5\n")
+    def mock_git(cmd, **_kwargs):
+        joined = " ".join(cmd)
+        if "rev-parse" in joined and "--abbrev-ref" in joined:
+            return MagicMock(returncode=0, stdout="main\n")
+        return MagicMock(returncode=0, stdout="5\n")
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("hermes_cli.banner.subprocess.run", return_value=mock_result) as mock_run:
+    with patch("hermes_cli.banner.subprocess.run", side_effect=mock_git) as mock_run:
         result = check_for_updates()
 
     assert result == 5
-    assert mock_run.call_count == 2  # git fetch + git rev-list
+    assert mock_run.call_count == 3  # git fetch + current branch + git rev-list
+    commands = [" ".join(call.args[0]) for call in mock_run.call_args_list]
+    assert any("rev-list --count HEAD..origin/main" in command for command in commands)
 
 
 def test_check_for_updates_no_git_dir(tmp_path, monkeypatch):

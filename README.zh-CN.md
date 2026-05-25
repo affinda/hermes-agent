@@ -31,7 +31,7 @@
 ## 快速安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/affinda/hermes-agent/affinda/slack-context-customization/scripts/install.sh | bash
 ```
 
 支持 Linux、macOS、WSL2 和 Android (Termux)。安装程序会自动处理平台特定的配置。
@@ -166,7 +166,7 @@ hermes claw migrate --overwrite  # 覆盖已有冲突
 贡献者快速开始——克隆并使用 `setup-hermes.sh`：
 
 ```bash
-git clone https://github.com/NousResearch/hermes-agent.git
+git clone https://github.com/affinda/hermes-agent.git
 cd hermes-agent
 ./setup-hermes.sh     # 安装 uv、创建 venv、安装 .[all]、创建符号链接 ~/.local/bin/hermes
 ./hermes              # 自动检测 venv，无需先 source

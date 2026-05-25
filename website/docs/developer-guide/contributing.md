@@ -41,7 +41,7 @@ We value contributions in this order:
 ### Clone and Install
 
 ```bash
-git clone --recurse-submodules https://github.com/NousResearch/hermes-agent.git
+git clone --recurse-submodules https://github.com/affinda/hermes-agent.git
 cd hermes-agent
 
 # Create venv with Python 3.11
