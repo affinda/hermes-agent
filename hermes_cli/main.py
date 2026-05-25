@@ -9008,6 +9008,31 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as e:
             logger.debug("Skills sync during update failed: %s", e)
 
+        # Sync marketplace plugin skills (configurable via marketplace_plugins;
+        # default: the 'affinda' plugin from affinda/plugin-marketplace). This
+        # re-fetches the marketplace so skills added upstream appear here on the
+        # next `hermes update`. Network/clone failures are reported, never fatal.
+        try:
+            from tools.marketplace_sync import sync_marketplace
+
+            print()
+            print("→ Syncing marketplace plugin skills...")
+            mp = sync_marketplace(quiet=True)
+            if mp.get("copied"):
+                print(f"  + {len(mp['copied'])} new: {', '.join(mp['copied'])}")
+            if mp.get("updated"):
+                print(f"  ↑ {len(mp['updated'])} updated: {', '.join(mp['updated'])}")
+            if mp.get("user_modified"):
+                print(f"  ~ {len(mp['user_modified'])} user-modified (kept)")
+            if mp.get("cleaned"):
+                print(f"  − {len(mp['cleaned'])} removed from manifest")
+            for err in mp.get("errors", []):
+                print(f"  ! {err}")
+            if not mp.get("copied") and not mp.get("updated") and not mp.get("errors"):
+                print("  ✓ Marketplace skills are up to date")
+        except Exception as e:
+            logger.debug("Marketplace skills sync during update failed: %s", e)
+
         # Sync bundled skills to all profiles (including the active one).
         # seed_profile_skills() uses subprocess with an explicit HERMES_HOME so
         # it is not affected by sync_skills()'s module-level HERMES_HOME cache,

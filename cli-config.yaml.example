@@ -764,6 +764,25 @@ platform_toolsets:
 # CLI override: hermes chat --toolsets terminal,web,file
 
 # =============================================================================
+# Marketplace plugin skills
+# =============================================================================
+# Pull skills from plugins in the Affinda plugin-marketplace. On each
+# `hermes update` the marketplace repo is re-fetched and any new or changed
+# skill folders are copied into ~/.hermes/skills/marketplace/<plugin>/ — so a
+# skill added to a plugin upstream shows up automatically on the next update.
+# Local edits and deletions of synced skills are preserved.
+#
+# Each item is either a bare plugin name (uses affinda/plugin-marketplace,
+# ref main) or a mapping {repo, plugin, ref}. Omit the key for the default
+# ([affinda]); set it to [] to disable marketplace sync.
+#
+# marketplace_plugins:
+#   - affinda
+#   - repo: affinda/plugin-marketplace
+#     plugin: pathfindr
+#     ref: main
+
+# =============================================================================
 # MCP (Model Context Protocol) Servers
 # =============================================================================
 # Connect to external MCP servers to add tools from the MCP ecosystem.

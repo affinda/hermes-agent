@@ -76,6 +76,12 @@ hermes update --yes
 hermes gateway restart
 ```
 
+### Marketplace plugin skills
+
+`hermes update` also pulls skills from configured [plugin-marketplace](https://github.com/affinda/plugin-marketplace) plugins. After the code `git pull` and bundled-skill sync, it re-fetches the marketplace and copies any new or changed skill folders into `~/.hermes/skills/marketplace/<plugin>/`. This means **a skill added to a plugin upstream appears on the agent at its next `hermes update`** — no fork change required. Local edits and deletions of synced skills are preserved (hash-tracked in `~/.hermes/skills/.marketplace_manifest`).
+
+By default agents track the `affinda` plugin. Configure via `marketplace_plugins` in `~/.hermes/config.yaml` (each item is a plugin name or a `{repo, plugin, ref}` mapping); set it to `[]` to disable. Marketplace sync only copies SKILL.md folders — MCP servers a plugin declares are still registered separately under `mcp_servers`. Run it on demand with `python -m tools.marketplace_sync`.
+
 ## Verification checklist
 
 Run these on each board after install or migration:
