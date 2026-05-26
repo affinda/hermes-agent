@@ -734,11 +734,29 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- Slack: native file uploads via files_upload_v2 ---
+    if platform == Platform.SLACK and media_files:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_slack(
+                pconfig.token,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_files if is_last else [],
+                force_document=force_document,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, slack, matrix, weixin, signal, yuanbao and feishu; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -746,7 +764,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu"
+            "native send_message media delivery is currently only supported for telegram, discord, slack, matrix, weixin, signal, yuanbao and feishu"
         )
 
     last_result = None
@@ -1036,8 +1054,55 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return _error(f"Telegram send failed: {e}")
 
 
-async def _send_slack(token, chat_id, message):
-    """Send via Slack Web API."""
+async def _send_slack(
+    token,
+    chat_id,
+    message,
+    *,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+):
+    """Send via Slack Web API, including native file uploads for MEDIA paths."""
+    media_files = media_files or []
+
+    if media_files:
+        try:
+            from slack_sdk.web.async_client import AsyncWebClient
+        except ImportError:
+            return {"error": "slack_sdk not installed. Run: pip install slack_sdk"}
+
+        try:
+            file_uploads = []
+            for media_path, _is_voice in media_files:
+                if not os.path.exists(media_path):
+                    return {"error": f"Slack media file not found: {media_path}"}
+                file_uploads.append({
+                    "file": media_path,
+                    "filename": os.path.basename(media_path),
+                })
+            if not file_uploads:
+                return {"error": "No valid Slack media files to upload"}
+
+            client = AsyncWebClient(token=token)
+            upload_kwargs = {
+                "channel": chat_id,
+                "file_uploads": file_uploads,
+                "initial_comment": message or "",
+            }
+            if thread_id:
+                upload_kwargs["thread_ts"] = thread_id
+            result = await client.files_upload_v2(**upload_kwargs)
+            return {
+                "success": True,
+                "platform": "slack",
+                "chat_id": chat_id,
+                "message_id": result.get("ts") or result.get("file", {}).get("timestamp"),
+                "files_uploaded": len(file_uploads),
+            }
+        except Exception as e:
+            return _error(f"Slack file upload failed: {e}")
+
     try:
         import aiohttp
     except ImportError:
@@ -1050,6 +1115,8 @@ async def _send_slack(token, chat_id, message):
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             payload = {"channel": chat_id, "text": message, "mrkdwn": True}
+            if thread_id:
+                payload["thread_ts"] = thread_id
             async with session.post(url, headers=headers, json=payload, **_req_kw) as resp:
                 data = await resp.json()
                 if data.get("ok"):
