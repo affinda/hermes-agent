@@ -774,10 +774,12 @@ platform_toolsets:
 #
 # Each item is either a bare plugin name (uses affinda/plugin-marketplace,
 # ref main) or a mapping {repo, plugin, ref}. Omit the key for the default
-# ([affinda]); set it to [] to disable marketplace sync.
+# ([affinda, hermesbots] — the base tool set plus shared Hermes-bot skills);
+# set it to [] to disable marketplace sync.
 #
 # marketplace_plugins:
 #   - affinda
+#   - hermesbots
 #   - repo: affinda/plugin-marketplace
 #     plugin: pathfindr
 #     ref: main

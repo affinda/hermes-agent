@@ -38,7 +38,8 @@ class TestConfiguredPlugins:
     def test_absent_key_uses_default(self):
         with self._with_config({}):
             assert _configured_plugins() == [
-                {"repo": DEFAULT_MARKETPLACE_REPO, "plugin": "affinda", "ref": DEFAULT_REF}
+                {"repo": DEFAULT_MARKETPLACE_REPO, "plugin": "affinda", "ref": DEFAULT_REF},
+                {"repo": DEFAULT_MARKETPLACE_REPO, "plugin": "hermesbots", "ref": DEFAULT_REF},
             ]
 
     def test_string_shorthand(self):

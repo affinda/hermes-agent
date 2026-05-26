@@ -27,7 +27,8 @@ bare plugin name (uses the default marketplace repo) or a mapping::
         plugin: pathfindr
         ref: main
 
-When the key is absent the default is ``[affinda]``. Set it to an empty list
+When the key is absent the default is ``[affinda, hermesbots]`` (the base tool
+set plus the shared Hermes-bots skills). Set it to an empty list
 (``marketplace_plugins: []``) to disable marketplace sync entirely.
 
 Manifest
@@ -68,7 +69,8 @@ DEST_CATEGORY = "marketplace"
 DEFAULT_MARKETPLACE_REPO = "affinda/plugin-marketplace"
 DEFAULT_REF = "main"
 DEFAULT_PLUGINS: List[dict] = [
-    {"repo": DEFAULT_MARKETPLACE_REPO, "plugin": "affinda", "ref": DEFAULT_REF}
+    {"repo": DEFAULT_MARKETPLACE_REPO, "plugin": "affinda", "ref": DEFAULT_REF},
+    {"repo": DEFAULT_MARKETPLACE_REPO, "plugin": "hermesbots", "ref": DEFAULT_REF},
 ]
 
 # Bound git operations so a hanging network never blocks `hermes update`.
@@ -83,8 +85,8 @@ def _configured_plugins() -> List[dict]:
     """Resolve the list of plugins to sync from ``~/.hermes/config.yaml``.
 
     Returns a list of ``{"repo", "plugin", "ref"}`` dicts. Absent config →
-    the default (``affinda`` from the default marketplace). An explicit empty
-    list disables sync.
+    the default (``affinda`` + ``hermesbots`` from the default marketplace).
+    An explicit empty list disables sync.
     """
     try:
         from hermes_cli.config import load_config_readonly
