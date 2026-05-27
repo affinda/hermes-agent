@@ -16356,7 +16356,18 @@ class GatewayRunner:
                 "reply_to_message_id": event_message_id,
             }
         else:
-            _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
+            # Mirror _progress_metadata so periodic "still working" / status
+            # messages thread under the triggering message. The bare
+            # _thread_metadata_for_source() returns None for a non-DM Slack
+            # top-level (non-thread) turn, which made status post at the
+            # channel root instead of threading under the triggering message
+            # like the progress accumulator already does. Keeps status always
+            # in-thread; the agent's final reply still chooses thread vs top.
+            _status_thread_metadata = (
+                self._thread_metadata_for_source(source, event_message_id)
+                if _progress_thread_id == source.thread_id
+                else {"thread_id": _progress_thread_id}
+            ) if _progress_thread_id else None
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
