@@ -329,6 +329,28 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 )
                 return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
             raise
+        except TypeError as exc:
+            # SDK Responses streaming accumulator crash: parse_response() does
+            # ``for output in response.output`` with no None-guard
+            # (openai/lib/_parsing/_responses.py). The ChatGPT codex backend
+            # (chatgpt.com/backend-api/codex) streams a terminal event whose
+            # ``response.output`` is null, so the SDK .stream() helper raises
+            # ``TypeError('NoneType' object is not iterable)`` on virtually
+            # every request (observed May 2026). api.openai.com never sends
+            # null output, so there is no SDK guard and no upstream fix
+            # (verified against openai 2.38.0). The raw create(stream=True)
+            # fallback does not call parse_response during accumulation and
+            # consumes the same stream cleanly, so route there exactly like
+            # the RuntimeError prelude/postlude cases above.
+            if "is not iterable" not in str(exc):
+                raise
+            logger.debug(
+                "Responses stream accumulator hit null response.output "
+                "(TypeError); falling back to create(stream=True). %s err=%s",
+                agent._client_log_context(),
+                exc,
+            )
+            return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
 
 
 
