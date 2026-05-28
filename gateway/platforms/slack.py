@@ -2167,7 +2167,18 @@ class SlackAdapter(BasePlatformAdapter):
                         user_id=user_id,
                     )
                 )
-                attention_active = human_context_enabled and self._slack_attention_active(surface_key)
+                # Passive (unmentioned) follow-up is scoped to threads the
+                # bot is already in — never to top-level channel messages.
+                # A main-channel message must @-mention the bot; this stops
+                # the bot replying to all channel chatter during the
+                # attention window after a single mention, while still
+                # following along inside threads. (tag-to-start, thread-to-
+                # follow; channel context is still fetched on the mention.)
+                attention_active = (
+                    human_context_enabled
+                    and is_thread_reply
+                    and self._slack_attention_active(surface_key)
+                )
                 if attention_active:
                     passive_followup = True
                     if not is_thread_reply:
