@@ -2093,11 +2093,13 @@ class SlackAdapter(BasePlatformAdapter):
         if team_id and channel_id:
             self._channel_team[channel_id] = team_id
 
-        # Determine if this is a DM or channel message
+        # Determine if this is a DM, group DM, or channel message.
         channel_type = event.get("channel_type", "")
         if not channel_type and channel_id.startswith("D"):
             channel_type = "im"
-        is_dm = channel_type in {"im", "mpim"}  # Both 1:1 and group DMs
+        is_one_to_one_dm = channel_type == "im"
+        is_group_dm = channel_type == "mpim"
+        is_dm = is_one_to_one_dm or is_group_dm
 
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a
@@ -2113,7 +2115,7 @@ class SlackAdapter(BasePlatformAdapter):
         else:
             thread_ts = event.get("thread_ts") or ts  # ts fallback for channels
 
-        # In channels, respond if:
+        # In shared Slack surfaces (channels and group DMs), respond if:
         #   0. Channel is in free_response_channels, OR require_mention is
         #      disabled — always process regardless of mention.
         #   1. The bot is @mentioned in this message, OR
@@ -2135,15 +2137,19 @@ class SlackAdapter(BasePlatformAdapter):
 
         human_context_enabled = self._slack_human_context_enabled()
 
-        if human_context_enabled and is_mentioned and not is_dm and not self._slack_strict_mention():
+        if human_context_enabled and is_mentioned and not is_one_to_one_dm and not self._slack_strict_mention():
             self._activate_slack_attention(surface_key, thread_ts=thread_ts)
 
-        if not is_dm and bot_uid:
-            # Check allowed channels — if set, only respond in these channels (whitelist)
-            allowed_channels = self._slack_allowed_channels()
-            if allowed_channels and channel_id not in allowed_channels:
-                logger.debug("[Slack] Ignoring message in non-allowed channel: %s", channel_id)
-                return
+        if not is_one_to_one_dm and bot_uid:
+            if not is_dm:
+                # Check allowed channels — if set, only respond in these channels (whitelist).
+                # Group DMs are intentionally excluded: they are private Slack
+                # conversations, but still require a mention when mention gating
+                # is enabled.
+                allowed_channels = self._slack_allowed_channels()
+                if allowed_channels and channel_id not in allowed_channels:
+                    logger.debug("[Slack] Ignoring message in non-allowed channel: %s", channel_id)
+                    return
 
             if channel_id in self._slack_free_response_channels():
                 pass  # Free-response channel — always process

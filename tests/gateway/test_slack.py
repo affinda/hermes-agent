@@ -1275,6 +1275,35 @@ class TestMessageRouting:
         adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_group_dm_requires_mention(self, adapter):
+        """Group DMs are shared Slack surfaces, so they obey mention gating."""
+        event = {
+            "text": "just talking",
+            "user": "U_USER",
+            "channel": "G123",
+            "channel_type": "mpim",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_group_dm_mention_strips_bot_id(self, adapter):
+        """Mentioned group-DM messages should process while keeping DM routing."""
+        event = {
+            "text": "<@U_BOT> what's the weather?",
+            "user": "U_USER",
+            "channel": "G123",
+            "channel_type": "mpim",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.source.chat_type == "dm"
+        assert msg_event.text == "what's the weather?"
+        assert "<@U_BOT>" not in msg_event.text
+
+    @pytest.mark.asyncio
     async def test_channel_message_requires_mention(self, adapter):
         """Channel messages without a bot mention should be ignored."""
         event = {
@@ -3413,7 +3442,7 @@ class TestSlackHumanLikeContext:
         assert msg_event.text == "current request"
 
     @pytest.mark.asyncio
-    async def test_attention_window_processes_unmentioned_channel_message_as_passive(self, contextual_adapter, monkeypatch):
+    async def test_attention_window_does_not_process_unmentioned_top_level_channel_message(self, contextual_adapter, monkeypatch):
         monkeypatch.setattr(_slack_mod.time, "monotonic", lambda: 100.0)
         await contextual_adapter._handle_slack_message({
             "text": "<@U_BOT> please watch this",
@@ -3431,6 +3460,40 @@ class TestSlackHumanLikeContext:
             "user": "U_OTHER",
             "channel": "C123",
             "ts": "121.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        })
+
+        contextual_adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_attention_window_processes_unmentioned_thread_message_as_passive(self, contextual_adapter, monkeypatch):
+        contextual_adapter._app.client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"ts": "100.000", "user": "U_PARENT", "text": "thread parent", "team": "T_TEAM"},
+                {"ts": "100.100", "user": "U_USER", "text": "<@U_BOT> please watch this", "team": "T_TEAM"},
+            ]
+        })
+        monkeypatch.setattr(_slack_mod.time, "monotonic", lambda: 100.0)
+        await contextual_adapter._handle_slack_message({
+            "text": "<@U_BOT> please watch this",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "100.100",
+            "thread_ts": "100.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        })
+        contextual_adapter.handle_message.reset_mock()
+        contextual_adapter._app.client.conversations_replies.reset_mock()
+        monkeypatch.setattr(_slack_mod.time, "monotonic", lambda: 120.0)
+
+        await contextual_adapter._handle_slack_message({
+            "text": "additional detail without mention",
+            "user": "U_OTHER",
+            "channel": "C123",
+            "ts": "121.000",
+            "thread_ts": "100.000",
             "channel_type": "channel",
             "team": "T_TEAM",
         })

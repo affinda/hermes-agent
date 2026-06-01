@@ -238,7 +238,7 @@ def test_free_response_channels_int_list():
 # Tests: mention gating integration (simulating _handle_slack_message logic)
 # ---------------------------------------------------------------------------
 
-def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
+def _would_process(adapter, *, is_dm=False, is_group_dm=False, channel_id=CHANNEL_ID,
                    text="hello", mentioned=False, thread_reply=False,
                    active_session=False):
     """Simulate the mention gating logic from _handle_slack_message.
@@ -250,12 +250,14 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
     if mentioned:
         text = f"<@{bot_uid}> {text}"
     is_mentioned = bot_uid and f"<@{bot_uid}>" in text
+    is_one_to_one_dm = is_dm and not is_group_dm
 
-    if not is_dm and bot_uid:
+    if not is_one_to_one_dm and bot_uid:
         # allowed_channels check (whitelist — must pass before other gating)
-        allowed = adapter._slack_allowed_channels()
-        if allowed and channel_id not in allowed:
-            return False
+        if not is_dm:
+            allowed = adapter._slack_allowed_channels()
+            if allowed and channel_id not in allowed:
+                return False
 
         if channel_id in adapter._slack_free_response_channels():
             return True
@@ -298,6 +300,27 @@ def test_other_channel_not_in_free_response_still_gated():
 def test_dm_always_processed_regardless_of_setting():
     adapter = _make_adapter(require_mention=True)
     assert _would_process(adapter, is_dm=True, text="hello") is True
+
+
+def test_group_dm_without_mention_is_gated():
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(adapter, is_dm=True, is_group_dm=True, text="hello") is False
+
+
+def test_group_dm_with_mention_is_processed():
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(adapter, is_dm=True, is_group_dm=True, mentioned=True) is True
+
+
+def test_group_dm_not_blocked_by_allowed_channels():
+    adapter = _make_adapter(require_mention=True, allowed_channels=[OTHER_CHANNEL_ID])
+    assert _would_process(
+        adapter,
+        is_dm=True,
+        is_group_dm=True,
+        channel_id=CHANNEL_ID,
+        mentioned=True,
+    ) is True
 
 
 def test_mentioned_message_always_processed():
