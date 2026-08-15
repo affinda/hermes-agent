@@ -2202,6 +2202,10 @@ class SecondaryPortBindingConfigError(MultiplexConfigError):
     """A secondary profile conflicts with the multiplexer's shared listener."""
 
 
+class SessionInboxTargetBusy(RuntimeError):
+    """The durable event must be deferred until its target turn is idle."""
+
+
 def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
     """Return the authoritative profile set for one multiplex gateway config."""
     from hermes_cli.profiles import profiles_to_serve
@@ -13375,6 +13379,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn so the agent kicks off the new chat.
         self._spawn_supervised(self._handoff_watcher, "handoff_watcher")
 
+        # Durable callbacks from external producers (notably DevAgent) share the
+        # normal message pipeline but are claimed/retried independently.
+        self._spawn_supervised(self._session_inbox_watcher, "session_inbox_watcher")
+
         # Start background async-delegation watcher — drains completion events
         # from delegate_task(background=true) subagents and injects each
         # result back into its originating session as a new turn, covering the
@@ -13634,6 +13642,152 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.debug("Handoff watcher tick error: %s", exc, exc_info=True)
             await asyncio.sleep(interval)
+
+    async def _session_inbox_watcher(self, interval: float = 2.0) -> None:
+        """Claim and deliver durable external session events."""
+        await asyncio.sleep(5)
+        while self._running:
+            try:
+                if self._session_db is None:
+                    await asyncio.sleep(interval)
+                    continue
+                pending = await self._session_db.list_queued_session_inbox_events(limit=20)
+                for row in pending:
+                    event_id = str(row.get("id") or "")
+                    if not event_id or not await self._session_db.claim_session_inbox_event(
+                        event_id, lease_seconds=21600
+                    ):
+                        continue
+                    claimed = await self._session_db.get_session_inbox_event(event_id) or row
+                    try:
+                        await self._process_session_inbox_event(claimed)
+                        await self._session_db.complete_session_inbox_event(event_id)
+                    except SessionInboxTargetBusy as exc:
+                        # Busy deferral is backpressure, not a failed attempt. It
+                        # may remain queued indefinitely without becoming dead.
+                        await self._session_db.defer_session_inbox_event(
+                            event_id, str(exc), backoff_seconds=10
+                        )
+                    except Exception as exc:
+                        attempts = int(claimed.get("attempts") or 0)
+                        await self._session_db.fail_session_inbox_event(
+                            event_id, str(exc), retry=attempts < 5,
+                            backoff_seconds=min(300, 5 * (2 ** max(attempts, 0))),
+                        )
+                        logger.warning(
+                            "Session inbox event %s failed (attempt %d): %s",
+                            event_id, attempts, exc, exc_info=True,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("Session inbox watcher tick failed", exc_info=True)
+            await asyncio.sleep(interval)
+
+    def _resolve_session_inbox_source(self, event_row: Dict[str, Any]) -> tuple[SessionSource, str]:
+        """Resolve and cross-check an event's source, routing key, and session."""
+        source = None
+        source_data = event_row.get("source_json")
+        if isinstance(source_data, dict):
+            try:
+                source = SessionSource.from_dict(source_data)
+            except Exception as exc:
+                raise RuntimeError(f"invalid source_json: {exc}") from exc
+
+        target_key = str(event_row.get("target_session_key") or "").strip()
+        target_id = str(event_row.get("target_session_id") or "").strip()
+        entry = None
+        if target_key:
+            lookup = getattr(self.session_store, "lookup_by_session_key", None)
+            if callable(lookup):
+                entry = lookup(target_key)
+            if entry is not None and not isinstance(getattr(entry, "origin", None), SessionSource):
+                entry = None
+            if entry is None:
+                legacy_lookup = getattr(self.session_store, "get_entry", None)
+                if callable(legacy_lookup):
+                    entry = legacy_lookup(target_key)
+                if entry is not None and not isinstance(getattr(entry, "origin", None), SessionSource):
+                    entry = None
+        if source is None and target_id:
+            lookup = getattr(self.session_store, "lookup_by_session_id", None)
+            if callable(lookup):
+                entry = lookup(target_id)
+            if entry is not None and not isinstance(getattr(entry, "origin", None), SessionSource):
+                entry = None
+            if entry is None:
+                legacy_lookup = getattr(self.session_store, "find_entry_by_session_id", None)
+                if callable(legacy_lookup):
+                    entry = legacy_lookup(target_id)
+                if entry is not None and not isinstance(getattr(entry, "origin", None), SessionSource):
+                    entry = None
+            if entry is not None:
+                source = entry.origin
+                target_key = entry.session_key
+        if source is None:
+            raise RuntimeError(
+                "could not resolve target source; provide source_json or an active target session mapping"
+            )
+
+        session_key = self._session_key_for_source(source)
+        if target_key and target_key != session_key:
+            if entry is None or entry.session_key != target_key:
+                raise RuntimeError("target_session_key does not match resolved source")
+            session_key = target_key
+        if target_key and target_id and entry is not None and entry.session_id != target_id:
+            raise RuntimeError("target_session_id does not match target_session_key")
+        return source, session_key
+
+    async def _process_session_inbox_event(self, event_row: Dict[str, Any]) -> None:
+        """Run at most one model turn, persist its response, then deliver it."""
+        source, session_key = self._resolve_session_inbox_source(event_row)
+        transport = resolve_delivery_transport(
+            source.platform, getattr(self, "config", None), self.adapters
+        )
+        if not transport:
+            raise RuntimeError(f"platform '{source.platform.value}' is not active")
+        adapter = transport.adapter
+
+        entry = self.session_store.get_or_create_session(source)
+        target_id = str(event_row.get("target_session_id") or "").strip()
+        if target_id and entry.session_id != target_id:
+            switched = self.session_store.switch_session(session_key, target_id)
+            if switched is None:
+                raise RuntimeError(f"could not bind target session {target_id}")
+            entry = switched
+            self._evict_cached_agent(session_key)
+
+        response_text = event_row.get("response_text")
+        if not response_text:
+            active = session_key in getattr(self, "_running_agents", {})
+            active = active or session_key in getattr(adapter, "_active_sessions", {})
+            if active:
+                raise SessionInboxTargetBusy("target session is busy; retrying later")
+            synthetic = MessageEvent(
+                text=str(event_row.get("text") or ""),
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message={
+                    "session_inbox_event_id": event_row.get("id"),
+                    "source": event_row.get("source"),
+                    "kind": event_row.get("kind"),
+                    "metadata": event_row.get("metadata") if isinstance(event_row.get("metadata"), dict) else {},
+                },
+                internal=True,
+            )
+            response_text = await self._handle_message(synthetic)
+            if response_text and self._session_db is not None and event_row.get("id"):
+                await self._session_db.mark_session_inbox_event_response_ready(
+                    str(event_row["id"]), str(response_text)
+                )
+        if not response_text:
+            return
+        result = await adapter.send(
+            chat_id=str(source.chat_id), content=str(response_text),
+            metadata=self._thread_metadata_for_source(source, None),
+        )
+        if not getattr(result, "success", True):
+            raise RuntimeError(f"adapter.send failed: {getattr(result, 'error', 'unknown error')}")
 
     async def _process_handoff(self, row: Dict[str, Any]) -> None:
         """Execute one handoff row. Raises on failure (caller marks failed)."""

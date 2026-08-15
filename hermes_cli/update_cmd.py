@@ -1824,6 +1824,20 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
     except Exception:
         pass
 
+    # Affinda's Claude-style marketplace is not a Hermes runtime plugin (there
+    # is no plugin.yaml), so use the narrow skill-only compatibility sync.
+    try:
+        from tools.marketplace_sync import sync_marketplace
+
+        marketplace = sync_marketplace(quiet=True)
+        if marketplace.get("copied") or marketplace.get("updated"):
+            print(
+                f"  ✓ Marketplace skills: {len(marketplace.get('copied', []))} new, "
+                f"{len(marketplace.get('updated', []))} updated"
+            )
+    except Exception as e:
+        logger.debug("Marketplace skill sync during zip update failed: %s", e)
+
     # Seed the model-catalog disk cache from the freshly-unpacked checkout
     # (same rationale as the git-pull path in _cmd_update_impl). Non-fatal.
     try:
@@ -7008,6 +7022,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print("  ✓ Skills are up to date")
         except Exception as e:
             logger.debug("Skills sync during update failed: %s", e)
+
+        try:
+            from tools.marketplace_sync import sync_marketplace
+
+            marketplace = sync_marketplace(quiet=True)
+            if marketplace.get("copied") or marketplace.get("updated"):
+                print(
+                    f"  ✓ Marketplace skills: {len(marketplace.get('copied', []))} new, "
+                    f"{len(marketplace.get('updated', []))} updated"
+                )
+        except Exception as e:
+            logger.debug("Marketplace skill sync during update failed: %s", e)
 
         # Sync bundled skills to all profiles (including the active one).
         # seed_profile_skills() uses subprocess with an explicit HERMES_HOME so

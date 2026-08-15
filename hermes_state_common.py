@@ -511,6 +511,31 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     delivery_claimed_at REAL
 );
 
+-- Durable ingress for trusted external producers. Model output is stored before
+-- transport delivery so failed sends retry without appending duplicate turns.
+CREATE TABLE IF NOT EXISTS session_inbox_events (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT UNIQUE,
+    target_session_id TEXT,
+    target_session_key TEXT,
+    source TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    source_json TEXT,
+    text TEXT NOT NULL,
+    metadata_json TEXT,
+    delivery_mode TEXT NOT NULL DEFAULT 'model',
+    status TEXT NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    available_at REAL NOT NULL,
+    locked_until REAL,
+    dispatched_at REAL,
+    failed_at REAL,
+    last_error TEXT,
+    response_text TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -527,6 +552,12 @@ CREATE INDEX IF NOT EXISTS idx_messages_assistant_calls_by_session
     WHERE role = 'assistant' AND tool_calls IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_turn_leases_expires ON session_turn_leases(expires_at);
+CREATE INDEX IF NOT EXISTS idx_session_inbox_ready
+    ON session_inbox_events(status, available_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_session_inbox_target_session
+    ON session_inbox_events(target_session_id);
+CREATE INDEX IF NOT EXISTS idx_session_inbox_target_key
+    ON session_inbox_events(target_session_key);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery

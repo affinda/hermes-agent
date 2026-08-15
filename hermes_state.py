@@ -29,6 +29,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 import weakref
 from collections import deque
 from contextlib import contextmanager
@@ -13612,6 +13613,157 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             result["error"] = str(exc)
 
         return result
+
+    # ── Session inbox events (trusted external turn injection) ─────────────
+
+    @staticmethod
+    def _decode_session_inbox_row(row) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        data = dict(row)
+        for raw_key, decoded_key in (("source_json", "source_json"), ("metadata_json", "metadata")):
+            raw = data.get(raw_key)
+            if raw:
+                try:
+                    data[decoded_key] = json.loads(raw)
+                except (TypeError, ValueError):
+                    data[decoded_key] = None
+            else:
+                data[decoded_key] = None
+        return data
+
+    def enqueue_session_inbox_event(
+        self, *, source: str, kind: str, text: str,
+        target_session_id: Optional[str] = None,
+        target_session_key: Optional[str] = None,
+        source_json: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        delivery_mode: str = "model",
+        idempotency_key: Optional[str] = None,
+        available_at: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Persist an external event, atomically deduplicating producer retries."""
+        if not str(source or "").strip():
+            raise ValueError("source is required")
+        if not str(kind or "").strip():
+            raise ValueError("kind is required")
+        if not str(text or "").strip():
+            raise ValueError("text is required")
+        if not target_session_id and not target_session_key and not source_json:
+            raise ValueError("target_session_id, target_session_key, or source_json is required")
+        if delivery_mode != "model":
+            raise ValueError("delivery_mode must be 'model'")
+
+        event_id = f"evt_{uuid.uuid4().hex}"
+        now = time.time()
+        available = float(available_at) if available_at is not None else now
+        source_raw = json.dumps(source_json, ensure_ascii=False, sort_keys=True) if source_json is not None else None
+        metadata_raw = json.dumps(metadata, ensure_ascii=False, sort_keys=True) if metadata is not None else None
+
+        def _do(conn):
+            if idempotency_key:
+                existing = conn.execute(
+                    "SELECT * FROM session_inbox_events WHERE idempotency_key = ?",
+                    (str(idempotency_key),),
+                ).fetchone()
+                if existing is not None:
+                    return self._decode_session_inbox_row(existing)
+            conn.execute(
+                """INSERT INTO session_inbox_events (
+                    id, idempotency_key, target_session_id, target_session_key,
+                    source, kind, source_json, text, metadata_json, delivery_mode,
+                    status, attempts, created_at, updated_at, available_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'model', 'queued', 0, ?, ?, ?)""",
+                (event_id, idempotency_key, target_session_id, target_session_key,
+                 str(source).strip(), str(kind).strip(), source_raw, str(text),
+                 metadata_raw, now, now, available),
+            )
+            return self._decode_session_inbox_row(conn.execute(
+                "SELECT * FROM session_inbox_events WHERE id = ?", (event_id,)
+            ).fetchone())
+
+        result = self._execute_write(_do)
+        if result is None:  # defensive: INSERT + SELECT above must return a row
+            raise RuntimeError("failed to persist session inbox event")
+        return result
+
+    def get_session_inbox_event(self, event_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            if self._conn is None:
+                return None
+            row = self._conn.execute(
+                "SELECT * FROM session_inbox_events WHERE id = ?", (event_id,)
+            ).fetchone()
+        return self._decode_session_inbox_row(row)
+
+    def list_queued_session_inbox_events(self, *, limit: int = 20, now: Optional[float] = None) -> List[Dict[str, Any]]:
+        current = time.time() if now is None else float(now)
+        with self._lock:
+            if self._conn is None:
+                return []
+            rows = self._conn.execute(
+                """SELECT * FROM session_inbox_events
+                   WHERE (status='queued' AND available_at <= ?)
+                      OR (status='processing' AND locked_until IS NOT NULL AND locked_until <= ?)
+                   ORDER BY created_at ASC LIMIT ?""",
+                (current, current, max(1, min(int(limit), 1000))),
+            ).fetchall()
+        result = []
+        for row in rows:
+            decoded = self._decode_session_inbox_row(row)
+            if decoded is not None:
+                result.append(decoded)
+        return result
+
+    def claim_session_inbox_event(self, event_id: str, *, lease_seconds: int = 21600) -> bool:
+        now = time.time()
+        def _do(conn):
+            cur = conn.execute(
+                """UPDATE session_inbox_events
+                   SET status='processing', attempts=attempts+1, updated_at=?,
+                       locked_until=?, last_error=NULL
+                   WHERE id=? AND ((status='queued' AND available_at <= ?)
+                     OR (status='processing' AND locked_until IS NOT NULL AND locked_until <= ?))""",
+                (now, now + max(1, int(lease_seconds)), event_id, now, now),
+            )
+            return cur.rowcount == 1
+        return bool(self._execute_write(_do))
+
+    def mark_session_inbox_event_response_ready(self, event_id: str, response_text: str) -> None:
+        now = time.time()
+        self._execute_write(lambda conn: conn.execute(
+            "UPDATE session_inbox_events SET updated_at=?, response_text=? WHERE id=? AND status='processing'",
+            (now, str(response_text), event_id),
+        ))
+
+    def complete_session_inbox_event(self, event_id: str) -> None:
+        now = time.time()
+        self._execute_write(lambda conn: conn.execute(
+            """UPDATE session_inbox_events SET status='dispatched', updated_at=?,
+               dispatched_at=?, locked_until=NULL, last_error=NULL WHERE id=?""",
+            (now, now, event_id),
+        ))
+
+    def fail_session_inbox_event(self, event_id: str, error: str, *, retry: bool = False, backoff_seconds: int = 30) -> None:
+        now = time.time()
+        status = "queued" if retry else "dead"
+        self._execute_write(lambda conn: conn.execute(
+            """UPDATE session_inbox_events SET status=?, updated_at=?, available_at=?,
+               locked_until=NULL, failed_at=?, last_error=? WHERE id=?""",
+            (status, now, now + max(0, int(backoff_seconds)) if retry else now,
+             None if retry else now, str(error)[:1000], event_id),
+        ))
+
+    def defer_session_inbox_event(self, event_id: str, reason: str, *, backoff_seconds: int = 10) -> None:
+        """Release a busy target without consuming a delivery attempt."""
+        now = time.time()
+        self._execute_write(lambda conn: conn.execute(
+            """UPDATE session_inbox_events SET status='queued',
+               attempts=MAX(attempts-1, 0), updated_at=?, available_at=?,
+               locked_until=NULL, failed_at=NULL, last_error=?
+               WHERE id=? AND status='processing'""",
+            (now, now + max(0, int(backoff_seconds)), str(reason)[:1000], event_id),
+        ))
 
     # ── Handoff (cross-platform session transfer) ──────────────────────────
     #

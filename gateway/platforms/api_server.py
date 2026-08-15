@@ -2,6 +2,7 @@
 OpenAI-compatible API server platform adapter.
 
 Exposes an HTTP server with endpoints:
+- POST /v1/session_inbox_events  — durable authenticated external callback ingress
 - POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
 - POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; X-Hermes-Session-Key supported)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
@@ -2238,6 +2239,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
+            ("POST", "/v1/session_inbox_events", self._handle_session_inbox_event),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
@@ -3225,6 +3227,78 @@ class APIServerAdapter(BasePlatformAdapter):
             "pid": os.getpid(),
         })
 
+    async def _handle_session_inbox_event(self, request: "web.Request") -> "web.Response":
+        """Enqueue a trusted external event for an existing gateway session."""
+        auth_error = self._check_auth(request)
+        if auth_error is not None:
+            return auth_error
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                _openai_error("Request body must be valid JSON.", code="invalid_json"),
+                status=400,
+            )
+        if not isinstance(body, dict):
+            return web.json_response(
+                _openai_error("Request body must be a JSON object.", code="invalid_request"),
+                status=400,
+            )
+        try:
+            source_json = body.get("source_json")
+            metadata = body.get("metadata", body.get("metadata_json"))
+            if source_json is not None and not isinstance(source_json, dict):
+                raise ValueError("source_json must be a JSON object")
+            if metadata is not None and not isinstance(metadata, dict):
+                raise ValueError("metadata must be a JSON object")
+            target_id = body.get("target_session_id") or body.get("session_id")
+            target_key = body.get("target_session_key") or body.get("session_key")
+            db = await self._ensure_session_db_async()
+            if db is None:
+                return web.json_response(
+                    _openai_error("Session database unavailable.", code="session_db_unavailable"),
+                    status=503,
+                )
+            # A supplied transcript id is an authority boundary, not a hint:
+            # reject typos/guesses at ingress rather than creating a fresh lane.
+            if target_id and await asyncio.to_thread(db.get_session, str(target_id)) is None:
+                return web.json_response(
+                    _openai_error("Target session not found.", code="session_not_found"),
+                    status=404,
+                )
+            event = await asyncio.to_thread(
+                db.enqueue_session_inbox_event,
+                source=str(body.get("source") or "").strip(),
+                kind=str(body.get("kind") or body.get("type") or "").strip(),
+                text=str(body.get("text") or ""),
+                target_session_id=target_id,
+                target_session_key=target_key,
+                source_json=source_json,
+                metadata=metadata,
+                delivery_mode=str(body.get("delivery_mode") or "model"),
+                idempotency_key=body.get("idempotency_key") or request.headers.get("Idempotency-Key"),
+            )
+        except (TypeError, ValueError) as exc:
+            return web.json_response(_openai_error(str(exc), code="invalid_request"), status=400)
+        except Exception as exc:
+            logger.exception("[api_server] failed to enqueue session inbox event")
+            return web.json_response(
+                _openai_error(f"Failed to enqueue session inbox event: {exc}", code="enqueue_failed"),
+                status=500,
+            )
+        return web.json_response(
+            {
+                "object": "hermes.session_inbox_event",
+                "id": event.get("id"),
+                "status": event.get("status"),
+                "target_session_id": event.get("target_session_id"),
+                "target_session_key": event.get("target_session_key"),
+                "source": event.get("source"),
+                "kind": event.get("kind"),
+            },
+            status=202,
+        )
+
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — list hermes-agent and any configured model_routes aliases.
 
@@ -3353,6 +3427,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "tool_progress_events": True,
                 "approval_events": True,
                 "session_resources": True,
+                "session_inbox_events": True,
                 "model_options": True,
                 "session_chat": True,
                 "session_chat_streaming": True,
@@ -3409,6 +3484,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
+                "session_inbox_events": {"method": "POST", "path": "/v1/session_inbox_events"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
