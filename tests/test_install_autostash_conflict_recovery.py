@@ -106,6 +106,66 @@ def test_install_sh_repository_stage_recovers_from_autostash_conflict(
 
 @pytest.mark.live_system_guard_bypass
 @pytest.mark.skipif(
+    shutil.which("git") is None or shutil.which("bash") is None,
+    reason="needs git and bash",
+)
+def test_install_sh_migrates_known_nous_checkout_to_affinda_distribution(
+    tmp_path: Path,
+) -> None:
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init")
+    (seed / "tracked.txt").write_text("base\n", encoding="utf-8")
+    _git(seed, "add", "tracked.txt")
+    _git(seed, "commit", "-m", "base")
+    _git(seed, "branch", "-M", "main")
+
+    remote = tmp_path / "affinda.git"
+    _git(tmp_path, "init", "--bare", str(remote))
+    _git(seed, "remote", "add", "origin", str(remote))
+    _git(seed, "push", "origin", "main")
+    _git(
+        seed,
+        "push",
+        "origin",
+        "main:refs/heads/affinda/slack-context-customization",
+    )
+
+    managed = tmp_path / "hermes-agent"
+    _git(tmp_path, "clone", "--branch", "main", str(remote), str(managed))
+    _git(
+        managed,
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/NousResearch/hermes-agent.git",
+    )
+
+    affinda_url = "https://github.com/affinda/hermes-agent.git"
+    env = os.environ | {
+        "HERMES_HOME": str(tmp_path / "hermes-home"),
+        "HERMES_INSTALL_DIR": str(managed),
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": f"url.file://{remote}/.insteadOf",
+        "GIT_CONFIG_VALUE_0": affinda_url,
+    }
+    result = subprocess.run(
+        ["bash", str(INSTALL_SH), "--stage", "repository", "--non-interactive"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _git(managed, "remote", "get-url", "origin").stdout.strip() == affinda_url
+    assert _git(managed, "branch", "--show-current").stdout.strip() == (
+        "affinda/slack-context-customization"
+    )
+
+
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.skipif(
     shutil.which("git") is None or POWERSHELL is None,
     reason="needs git and PowerShell",
 )

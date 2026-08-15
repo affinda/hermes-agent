@@ -43,6 +43,10 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # Configuration
+REPO_URL_EXPLICIT=false
+if [ -n "${HERMES_INSTALL_REPO_URL_SSH:-}${HERMES_INSTALL_REPO_URL_HTTPS:-}${HERMES_INSTALL_REPO_URL:-}" ]; then
+    REPO_URL_EXPLICIT=true
+fi
 REPO_URL_SSH="${HERMES_INSTALL_REPO_URL_SSH:-git@github.com:affinda/hermes-agent.git}"
 REPO_URL_HTTPS="${HERMES_INSTALL_REPO_URL_HTTPS:-${HERMES_INSTALL_REPO_URL:-https://github.com/affinda/hermes-agent.git}}"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
@@ -72,6 +76,8 @@ RUN_SETUP=true
 SKIP_BROWSER=false
 SKIP_COMPUTER_USE=false
 NO_SKILLS=false
+BRANCH_EXPLICIT=false
+[ -n "${HERMES_INSTALL_BRANCH:-}" ] && BRANCH_EXPLICIT=true
 BRANCH="${HERMES_INSTALL_BRANCH:-affinda/slack-context-customization}"
 INSTALL_COMMIT=""
 FORCE_COMMIT=false
@@ -117,11 +123,13 @@ while [[ $# -gt 0 ]]; do
             ;;
         --branch|-Branch)
             BRANCH="$2"
+            BRANCH_EXPLICIT=true
             shift 2
             ;;
         --repo-url)
             REPO_URL_HTTPS="$2"
             REPO_URL_SSH="$2"
+            REPO_URL_EXPLICIT=true
             shift 2
             ;;
         --commit|-Commit)
@@ -1267,6 +1275,25 @@ clone_repo() {
         if [ -d "$INSTALL_DIR/.git" ]; then
             log_info "Existing installation found, updating..."
             cd "$INSTALL_DIR"
+
+            # Distribution defaults are for new/official Hermes installs, not
+            # arbitrary repositories that happen to be used as INSTALL_DIR in
+            # development or automation. Migrate known Nous/Affinda origins to
+            # the managed Affinda fork, but otherwise preserve the existing
+            # origin and branch unless the caller explicitly overrode them.
+            local existing_origin existing_branch managed_origin=false
+            existing_origin="$(git remote get-url origin 2>/dev/null || true)"
+            existing_branch="$(git branch --show-current 2>/dev/null || true)"
+            case "$existing_origin" in
+                https://github.com/NousResearch/hermes-agent|https://github.com/NousResearch/hermes-agent.git|git@github.com:NousResearch/hermes-agent|git@github.com:NousResearch/hermes-agent.git|https://github.com/affinda/hermes-agent|https://github.com/affinda/hermes-agent.git|git@github.com:affinda/hermes-agent|git@github.com:affinda/hermes-agent.git)
+                    managed_origin=true
+                    ;;
+            esac
+            if [ "$REPO_URL_EXPLICIT" = true ] || [ "$managed_origin" = true ]; then
+                git remote set-url origin "$REPO_URL_HTTPS"
+            elif [ "$BRANCH_EXPLICIT" = false ] && [ -n "$existing_branch" ]; then
+                BRANCH="$existing_branch"
+            fi
 
             local autostash_ref=""
             discard_update_lockfile_churn "$INSTALL_DIR"

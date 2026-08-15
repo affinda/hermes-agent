@@ -378,6 +378,8 @@ $script:ResolvedPathReport = @{
 $RepoUrlSsh = $(if ($env:HERMES_INSTALL_REPO_URL_SSH) { $env:HERMES_INSTALL_REPO_URL_SSH } elseif ($RepoUrl -eq "https://github.com/affinda/hermes-agent.git") { "git@github.com:affinda/hermes-agent.git" } else { $RepoUrl })
 $RepoUrlHttps = $RepoUrl
 $ArchiveBaseUrl = $RepoUrlHttps -replace '\.git$', ''
+$BranchExplicit = $PSBoundParameters.ContainsKey("Branch") -or [bool]$env:HERMES_INSTALL_BRANCH
+$RepoUrlExplicit = $PSBoundParameters.ContainsKey("RepoUrl") -or [bool]$env:HERMES_INSTALL_REPO_URL -or [bool]$env:HERMES_INSTALL_REPO_URL_SSH
 $PythonVersion = "3.11"
 # Minor versions the installer accepts when the requested $PythonVersion isn't
 # available, in preference order.  uv discovers both uv-managed and system
@@ -2044,6 +2046,20 @@ function Install-Repository {
             $ErrorActionPreference = "Continue"
             $autostashRef = ""
             try {
+                # Distribution defaults apply to new/official Hermes installs,
+                # not arbitrary repositories used as InstallDir in development
+                # or automation. Migrate known Nous/Affinda origins, otherwise
+                # preserve the existing origin and branch unless explicitly set.
+                $existingOrigin = (& git -c windows.appendAtomically=false remote get-url origin 2>$null)
+                $existingBranch = (& git -c windows.appendAtomically=false branch --show-current 2>$null)
+                $managedOrigin = $existingOrigin -match '^(https://github\.com/(NousResearch|affinda)/hermes-agent(?:\.git)?|git@github\.com:(NousResearch|affinda)/hermes-agent(?:\.git)?)$'
+                if ($RepoUrlExplicit -or $managedOrigin) {
+                    git -c windows.appendAtomically=false remote set-url origin $RepoUrlHttps
+                    if ($LASTEXITCODE -ne 0) { throw "git remote set-url origin failed (exit $LASTEXITCODE)" }
+                } elseif ((-not $BranchExplicit) -and $existingBranch) {
+                    $Branch = ("$existingBranch").Trim()
+                }
+
                 # This is a MANAGED checkout, not a repo the user edits. Git for
                 # Windows defaults to core.autocrlf=true, which renormalizes the
                 # repo's LF-only text files to CRLF in the working tree -- so
