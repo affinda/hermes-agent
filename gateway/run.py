@@ -2206,6 +2206,10 @@ class SessionInboxTargetBusy(RuntimeError):
     """The durable event must be deferred until its target turn is idle."""
 
 
+class SessionInboxModelOutcomeUnknown(RuntimeError):
+    """A prior process may have completed the turn but not saved its response."""
+
+
 def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
     """Return the authoritative profile set for one multiplex gateway config."""
     from hermes_cli.profiles import profiles_to_serve
@@ -13668,6 +13672,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await self._session_db.defer_session_inbox_event(
                             event_id, str(exc), backoff_seconds=10
                         )
+                    except SessionInboxModelOutcomeUnknown as exc:
+                        # At-most-once is safer than replaying a turn whose
+                        # transcript commit may have completed before a crash.
+                        await self._session_db.fail_session_inbox_event(
+                            event_id, str(exc), retry=False
+                        )
+                        logger.error(
+                            "Session inbox event %s is indeterminate: %s",
+                            event_id,
+                            exc,
+                        )
                     except Exception as exc:
                         attempts = int(claimed.get("attempts") or 0)
                         await self._session_db.fail_session_inbox_event(
@@ -13685,7 +13700,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await asyncio.sleep(interval)
 
     def _resolve_session_inbox_source(self, event_row: Dict[str, Any]) -> tuple[SessionSource, str]:
-        """Resolve and cross-check an event's source, routing key, and session."""
+        """Resolve and strictly cross-check source, routing key, and session."""
         source = None
         source_data = event_row.get("source_json")
         if isinstance(source_data, dict):
@@ -13696,34 +13711,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         target_key = str(event_row.get("target_session_key") or "").strip()
         target_id = str(event_row.get("target_session_id") or "").strip()
-        entry = None
+
+        def _valid_entry(candidate):
+            if candidate is None:
+                return None
+            if not isinstance(getattr(candidate, "origin", None), SessionSource):
+                return None
+            return candidate
+
+        key_entry = None
         if target_key:
             lookup = getattr(self.session_store, "lookup_by_session_key", None)
             if callable(lookup):
-                entry = lookup(target_key)
-            if entry is not None and not isinstance(getattr(entry, "origin", None), SessionSource):
-                entry = None
-            if entry is None:
+                key_entry = _valid_entry(lookup(target_key))
+            if key_entry is None:
                 legacy_lookup = getattr(self.session_store, "get_entry", None)
                 if callable(legacy_lookup):
-                    entry = legacy_lookup(target_key)
-                if entry is not None and not isinstance(getattr(entry, "origin", None), SessionSource):
-                    entry = None
-        if source is None and target_id:
+                    key_entry = _valid_entry(legacy_lookup(target_key))
+
+        id_entry = None
+        if target_id:
             lookup = getattr(self.session_store, "lookup_by_session_id", None)
             if callable(lookup):
-                entry = lookup(target_id)
-            if entry is not None and not isinstance(getattr(entry, "origin", None), SessionSource):
-                entry = None
-            if entry is None:
+                id_entry = _valid_entry(lookup(target_id))
+            if id_entry is None:
                 legacy_lookup = getattr(self.session_store, "find_entry_by_session_id", None)
                 if callable(legacy_lookup):
-                    entry = legacy_lookup(target_id)
-                if entry is not None and not isinstance(getattr(entry, "origin", None), SessionSource):
-                    entry = None
-            if entry is not None:
-                source = entry.origin
-                target_key = entry.session_key
+                    id_entry = _valid_entry(legacy_lookup(target_id))
+
+        if key_entry is not None and key_entry.session_key != target_key:
+            raise RuntimeError("target_session_key lookup returned a different routing key")
+        if id_entry is not None and id_entry.session_id != target_id:
+            raise RuntimeError("target_session_id lookup returned a different session")
+        if key_entry is not None and target_id and key_entry.session_id != target_id:
+            raise RuntimeError("target_session_id does not match target_session_key")
+        if id_entry is not None and target_key and id_entry.session_key != target_key:
+            raise RuntimeError("target_session_key does not match target_session_id")
+
+        mapped_source = (
+            key_entry.origin
+            if key_entry is not None
+            else id_entry.origin if id_entry is not None else None
+        )
+        if source is None:
+            source = mapped_source
         if source is None:
             raise RuntimeError(
                 "could not resolve target source; provide source_json or an active target session mapping"
@@ -13731,12 +13762,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         session_key = self._session_key_for_source(source)
         if target_key and target_key != session_key:
-            if entry is None or entry.session_key != target_key:
-                raise RuntimeError("target_session_key does not match resolved source")
-            session_key = target_key
-        if target_key and target_id and entry is not None and entry.session_id != target_id:
-            raise RuntimeError("target_session_id does not match target_session_key")
-        return source, session_key
+            raise RuntimeError("target_session_key does not match resolved source")
+        if mapped_source is not None:
+            mapped_key = self._session_key_for_source(mapped_source)
+            if mapped_key != session_key:
+                raise RuntimeError("source_json does not match the target session mapping")
+        return source, target_key or session_key
+
+    async def _reserve_session_inbox_model_turn(self, event: MessageEvent) -> None:
+        """Reserve an inbox event's one allowed model turn, if applicable."""
+        event_id = ""
+        if event.internal and isinstance(getattr(event, "raw_message", None), dict):
+            event_id = str(
+                event.raw_message.get("session_inbox_event_id") or ""
+            ).strip()
+        if getattr(self, "_session_db", None) is None or not event_id:
+            return
+        started = await self._session_db.mark_session_inbox_event_model_started(event_id)
+        if not started:
+            raise SessionInboxModelOutcomeUnknown(
+                "a prior process started this model turn but did not persist "
+                "its response; refusing to append a duplicate turn"
+            )
 
     async def _process_session_inbox_event(self, event_row: Dict[str, Any]) -> None:
         """Run at most one model turn, persist its response, then deliver it."""
@@ -13748,21 +13795,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise RuntimeError(f"platform '{source.platform.value}' is not active")
         adapter = transport.adapter
 
-        entry = self.session_store.get_or_create_session(source)
-        target_id = str(event_row.get("target_session_id") or "").strip()
-        if target_id and entry.session_id != target_id:
-            switched = self.session_store.switch_session(session_key, target_id)
-            if switched is None:
-                raise RuntimeError(f"could not bind target session {target_id}")
-            entry = switched
-            self._evict_cached_agent(session_key)
-
         response_text = event_row.get("response_text")
         if not response_text:
             active = session_key in getattr(self, "_running_agents", {})
             active = active or session_key in getattr(adapter, "_active_sessions", {})
             if active:
                 raise SessionInboxTargetBusy("target session is busy; retrying later")
+
+            # Session selection mutates the live binding, so it must happen
+            # only after the busy check. Response-ready retries never need to
+            # reopen or switch a transcript merely to retry transport delivery.
+            entry = self.session_store.get_or_create_session(source)
+            target_id = str(event_row.get("target_session_id") or "").strip()
+            if target_id and entry.session_id != target_id:
+                switched = self.session_store.switch_session(session_key, target_id)
+                if switched is None:
+                    raise RuntimeError(f"could not bind target session {target_id}")
+                self._evict_cached_agent(session_key)
+
             synthetic = MessageEvent(
                 text=str(event_row.get("text") or ""),
                 message_type=MessageType.TEXT,
@@ -17112,6 +17162,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+        _session_inbox_event_id = ""
+        if is_internal and isinstance(getattr(event, "raw_message", None), dict):
+            _session_inbox_event_id = str(
+                event.raw_message.get("session_inbox_event_id") or ""
+            ).strip()
         allow_gateway_control = event.allow_gateway_control
         _up_state = self._peek_session_state(_quick_key)
         if (
@@ -17378,6 +17433,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._release_running_agent_state(_quick_key)
 
         if self._is_session_running(_quick_key):
+            # Durable inbox work is never a user steering/interrupt message.
+            # If another turn won the lane during setup, defer it without
+            # consuming the event's single model-turn reservation.
+            if _session_inbox_event_id:
+                raise SessionInboxTargetBusy("target session is busy; retrying later")
             # Resolve the command once; every command's mid-run behavior is
             # declared on its CommandDef (busy_policy / busy_handler in
             # hermes_cli/commands.py) and dispatched through the single
@@ -18368,6 +18428,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _quick_key,
                     exc.session_id,
                 )
+                if _session_inbox_event_id:
+                    raise SessionInboxTargetBusy(
+                        "target session lease is busy; retrying later"
+                    ) from exc
                 return (
                     "⏳ Another turn is still running on this session. To "
                     "protect the transcript, this message was not processed. "
@@ -19535,6 +19599,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _lease_state = self._session_state(_quick_key).turn
                 _lease_state.lease_token = _lease_token
                 _lease_state.lease_generation = run_generation
+
+        # Session resolution and turn-lease acquisition are final. Reserve a
+        # durable inbox event immediately before the first transcript/model
+        # side effect, so setup/lease failures remain safely retryable while a
+        # crashed model turn can never be appended twice.
+        await self._reserve_session_inbox_model_turn(event)
 
         # A turn only becomes durable recovery work after it owns (or has
         # explicitly degraded past) the per-session lease.  Marking before the

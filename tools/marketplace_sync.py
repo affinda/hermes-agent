@@ -245,6 +245,42 @@ def _iter_skill_dirs(src: Path):
         yield skill_md.parent
 
 
+def _safe_marketplace_skill_dir(skill_dir: Path, source_root: Path) -> bool:
+    """Reject symlinks and paths escaping the checked-out plugin skill root."""
+    try:
+        skill_dir.resolve().relative_to(source_root.resolve())
+    except (OSError, ValueError):
+        return False
+    try:
+        if skill_dir.is_symlink():
+            return False
+        return not any(path.is_symlink() for path in skill_dir.rglob("*"))
+    except OSError:
+        return False
+
+
+def _safe_subpath(path: Path, root: Path, *, require_exists: bool) -> bool:
+    """Require lexical/resolved containment and no symlink below *root*.
+
+    ``root`` itself may be a user-configured symlink (for example a relocated
+    HERMES_HOME), but repository-controlled or marketplace-managed components
+    beneath it must be concrete directories/files.
+    """
+    try:
+        relative = path.relative_to(root)
+        root_resolved = root.resolve(strict=False)
+        current = root
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                return False
+        resolved = path.resolve(strict=require_exists)
+        resolved.relative_to(root_resolved)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def _sync_tree(src: Path, dest_root: Path, manifest: Dict[str, str], quiet: bool) -> dict:
     """Copy skill folders from *src* into *dest_root*, updating *manifest*.
 
@@ -260,8 +296,16 @@ def _sync_tree(src: Path, dest_root: Path, manifest: Dict[str, str], quiet: bool
     seen_keys: set[str] = set()
 
     for skill_dir in _iter_skill_dirs(src):
+        if not _safe_marketplace_skill_dir(skill_dir, src):
+            skipped += 1
+            logger.warning("Skipping unsafe marketplace skill tree: %s", skill_dir)
+            continue
         rel = skill_dir.relative_to(src)
         dest = dest_root / rel
+        if not _safe_subpath(dest, SKILLS_DIR, require_exists=False):
+            skipped += 1
+            logger.warning("Skipping unsafe marketplace destination: %s", dest)
+            continue
         key = str(dest.relative_to(SKILLS_DIR))
         seen_keys.add(key)
         src_hash = _dir_hash(skill_dir)
@@ -311,21 +355,74 @@ def _sync_tree(src: Path, dest_root: Path, manifest: Dict[str, str], quiet: bool
             continue
 
         if src_hash != origin_hash:
-            backup = dest.with_suffix(".bak")
+            backup_container: Path | None = None
             try:
-                shutil.move(str(dest), str(backup))
+                backup_container = Path(
+                    tempfile.mkdtemp(
+                        prefix=f".{dest.name}.marketplace-backup-",
+                        dir=str(dest.parent),
+                    )
+                )
+                backup = backup_container / "skill"
+                if not _safe_subpath(
+                    backup_container, SKILLS_DIR, require_exists=True
+                ):
+                    raise OSError("unsafe marketplace backup path")
+                # The destination inside the freshly-created private container
+                # is guaranteed not to exist; rename is atomic on this filesystem.
+                dest.rename(backup)
                 try:
                     shutil.copytree(skill_dir, dest)
+                except (OSError, IOError):
+                    # Best-effort rollback. If any cleanup/restoration step
+                    # fails, retain the private backup container for recovery;
+                    # never delete the only known-good copy.
+                    try:
+                        if dest.exists():
+                            if dest.is_symlink() or dest.is_file():
+                                dest.unlink()
+                            else:
+                                shutil.rmtree(dest)
+                        if backup.exists():
+                            backup.rename(dest)
+                    except (OSError, IOError) as restore_error:
+                        logger.error(
+                            "Marketplace rollback incomplete for %s; retained backup at %s: %s",
+                            name,
+                            backup_container,
+                            restore_error,
+                        )
+                    else:
+                        if backup_container.exists():
+                            shutil.rmtree(backup_container, ignore_errors=True)
+                        backup_container = None
+                    raise
+                else:
+                    try:
+                        shutil.rmtree(backup_container)
+                    except (OSError, IOError) as cleanup_error:
+                        logger.warning(
+                            "Marketplace update for %s succeeded; retained stale backup at %s: %s",
+                            name,
+                            backup_container,
+                            cleanup_error,
+                        )
+                    backup_container = None
                     manifest[key] = src_hash
                     updated.append(name)
                     if not quiet:
                         print(f"  ↑ {name} (updated)")
-                    shutil.rmtree(backup, ignore_errors=True)
-                except (OSError, IOError):
-                    if backup.exists() and not dest.exists():
-                        shutil.move(str(backup), str(dest))
-                    raise
             except (OSError, IOError) as e:
+                if backup_container is not None and backup_container.exists():
+                    backup = backup_container / "skill"
+                    if backup.exists():
+                        logger.error(
+                            "Retaining marketplace recovery backup for %s at %s",
+                            name,
+                            backup_container,
+                        )
+                    else:
+                        shutil.rmtree(backup_container, ignore_errors=True)
                 if not quiet:
                     print(f"  ! Failed to update {name}: {e}")
         else:
@@ -341,6 +438,9 @@ def _sync_tree(src: Path, dest_root: Path, manifest: Dict[str, str], quiet: bool
 
 
 def _write_plugin_description(dest_root: Path, repo: str, plugin: str) -> None:
+    if not _safe_subpath(dest_root, SKILLS_DIR, require_exists=False):
+        logger.warning("Skipping unsafe marketplace description path: %s", dest_root)
+        return
     desc = dest_root / "DESCRIPTION.md"
     if desc.exists():
         return
@@ -391,8 +491,18 @@ def sync_marketplace(quiet: bool = False) -> dict:
         if not src.is_dir():
             summary["errors"].append(f"{repo}: plugin '{plugin}' has no skills/ directory")
             continue
+        if clone.is_symlink() or not _safe_subpath(src, clone, require_exists=True):
+            summary["errors"].append(
+                f"{repo}: plugin '{plugin}' has an unsafe skills/ directory"
+            )
+            continue
 
         dest_root = SKILLS_DIR / DEST_CATEGORY / plugin
+        if not _safe_subpath(dest_root, SKILLS_DIR, require_exists=False):
+            summary["errors"].append(
+                f"{repo}: plugin '{plugin}' has an unsafe destination path"
+            )
+            continue
         res = _sync_tree(src, dest_root, manifest, quiet)
         _write_plugin_description(dest_root, repo, plugin)
 

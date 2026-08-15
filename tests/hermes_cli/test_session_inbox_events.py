@@ -36,7 +36,8 @@ class TestSessionInboxEventDB:
         db._conn.execute(
             "SELECT id, source, kind, target_session_id, target_session_key, "
             "source_json, text, metadata_json, delivery_mode, status, attempts, "
-            "available_at, locked_until, last_error, response_text FROM session_inbox_events LIMIT 0"
+            "available_at, locked_until, last_error, model_started_at, "
+            "response_text FROM session_inbox_events LIMIT 0"
         )
 
     def test_enqueue_session_inbox_event_creates_queued_row(self, db):
@@ -171,6 +172,19 @@ class TestSessionInboxEventDB:
         retry_event = db.list_queued_session_inbox_events()[0]
         assert retry_event["id"] == event["id"]
         assert retry_event["response_text"] == "already generated"
+
+    def test_model_turn_can_only_be_reserved_once(self, db):
+        event = db.enqueue_session_inbox_event(
+            target_session_id="sess-model-once",
+            source="devagent",
+            kind="completion",
+            text="Done",
+        )
+        assert db.claim_session_inbox_event(event["id"], lease_seconds=30) is True
+        assert db.mark_session_inbox_event_model_started(event["id"]) is True
+        assert db.mark_session_inbox_event_model_started(event["id"]) is False
+        stored = db.get_session_inbox_event(event["id"])
+        assert stored["model_started_at"] is not None
 
     def test_session_inbox_event_json_fields_round_trip(self, db):
         source_json = {"platform": "slack", "chat_id": "D123", "chat_type": "dm", "thread_id": "177.1"}

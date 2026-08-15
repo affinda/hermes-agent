@@ -533,6 +533,7 @@ CREATE TABLE IF NOT EXISTS session_inbox_events (
     dispatched_at REAL,
     failed_at REAL,
     last_error TEXT,
+    model_started_at REAL,
     response_text TEXT
 );
 

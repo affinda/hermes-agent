@@ -258,6 +258,61 @@ async def test_internal_root_telegram_dm_event_bypasses_topic_lobby(
 
 
 @pytest.mark.asyncio
+async def test_session_inbox_model_reservation_rejects_indeterminate_replay():
+    from gateway.run import SessionInboxModelOutcomeUnknown
+
+    runner = _make_runner()
+    runner._session_db = SimpleNamespace(
+        mark_session_inbox_event_model_started=AsyncMock(return_value=False)
+    )
+    event = MessageEvent(
+        text="[SYSTEM: durable completion]",
+        source=_make_source(thread_id="1"),
+        message_id="wake-inbox",
+        raw_message={"session_inbox_event_id": "evt-indeterminate"},
+        internal=True,
+    )
+
+    with pytest.raises(SessionInboxModelOutcomeUnknown, match="duplicate turn"):
+        await runner._reserve_session_inbox_model_turn(event)
+
+    runner._session_db.mark_session_inbox_event_model_started.assert_awaited_once_with(
+        "evt-indeterminate"
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_inbox_event_defers_if_user_turn_wins_lane(monkeypatch):
+    import gateway.run as gateway_run
+    from gateway.run import SessionInboxTargetBusy
+
+    runner = _make_runner()
+    runner._telegram_topic_mode_enabled = lambda source: True
+    runner._session_db = SimpleNamespace(
+        mark_session_inbox_event_model_started=AsyncMock(return_value=True)
+    )
+    source = _make_source(thread_id="1")
+    session_key = runner._session_key_for_source(source)
+    runner._running_agents[session_key] = object()
+    runner._running_agents_ts[session_key] = 1.0
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    event = MessageEvent(
+        text="[SYSTEM: durable completion]",
+        source=source,
+        message_id="wake-busy",
+        raw_message={"session_inbox_event_id": "evt-busy"},
+        internal=True,
+    )
+
+    with pytest.raises(SessionInboxTargetBusy, match="target session is busy"):
+        await runner._handle_message(event)
+
+    runner._session_db.mark_session_inbox_event_model_started.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_root_telegram_dm_new_shows_create_topic_instruction(monkeypatch):
     import gateway.run as gateway_run
 

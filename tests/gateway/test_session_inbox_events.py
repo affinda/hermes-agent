@@ -38,6 +38,9 @@ async def test_process_session_inbox_event_dispatches_internal_turn_to_source_js
     runner.session_store.find_entry_by_session_id.return_value = None
     runner._handle_message = AsyncMock(return_value="reviewed result")
     runner._session_db = MagicMock()
+    runner._session_db.mark_session_inbox_event_model_started = AsyncMock(
+        return_value=True
+    )
     runner._session_db.mark_session_inbox_event_response_ready = AsyncMock()
     runner._evict_cached_agent = MagicMock()
 
@@ -94,6 +97,9 @@ async def test_process_session_inbox_event_switches_session_when_source_key_poin
     runner.session_store.find_entry_by_session_id.return_value = None
     runner._handle_message = AsyncMock(return_value=None)
     runner._session_db = MagicMock()
+    runner._session_db.mark_session_inbox_event_model_started = AsyncMock(
+        return_value=True
+    )
     runner._evict_cached_agent = MagicMock()
 
     await runner._process_session_inbox_event(
@@ -154,6 +160,9 @@ async def test_process_session_inbox_event_defers_when_target_session_busy():
 
     runner._handle_message.assert_not_awaited()
     adapter.send.assert_not_awaited()
+    runner.session_store.get_or_create_session.assert_not_called()
+    runner.session_store.switch_session.assert_not_called()
+    runner._evict_cached_agent.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -195,6 +204,9 @@ async def test_process_session_inbox_event_retries_saved_response_without_rerunn
 
     runner._handle_message.assert_not_awaited()
     runner._session_db.mark_session_inbox_event_response_ready.assert_not_called()
+    runner.session_store.get_or_create_session.assert_not_called()
+    runner.session_store.switch_session.assert_not_called()
+    runner._evict_cached_agent.assert_not_called()
     adapter.send.assert_awaited_once()
     assert adapter.send.await_args.kwargs["content"] == "cached response"
 
@@ -218,6 +230,61 @@ def test_resolve_session_inbox_source_can_use_active_session_id_mapping():
 
     assert resolved_source == source
     assert resolved_key == session_key
+
+
+def test_resolve_session_inbox_source_can_use_session_key_only_mapping():
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="D123",
+        chat_type="dm",
+        user_id="U123",
+    )
+    session_key = build_session_key(source)
+    entry = SimpleNamespace(session_id="sess-123", session_key=session_key, origin=source)
+    runner.session_store = MagicMock()
+    runner.session_store.lookup_by_session_key.return_value = entry
+
+    resolved_source, resolved_key = runner._resolve_session_inbox_source(
+        {"target_session_key": session_key, "source_json": None}
+    )
+
+    assert resolved_source == source
+    assert resolved_key == session_key
+
+
+def test_resolve_session_inbox_source_rejects_mismatched_source_and_key():
+    runner = object.__new__(GatewayRunner)
+    source_a = SessionSource(
+        platform=Platform.SLACK,
+        user_id="U1",
+        chat_id="D1",
+        user_name="requester",
+        chat_type="dm",
+    )
+    source_b = SessionSource(
+        platform=Platform.SLACK,
+        user_id="U2",
+        chat_id="D2",
+        user_name="other",
+        chat_type="dm",
+    )
+    key_a = "agent:main:slack:dm:U1"
+    entry = SimpleNamespace(origin=source_a, session_key=key_a, session_id="sess-a")
+    runner.session_store = MagicMock()
+    runner.session_store.lookup_by_session_key.return_value = entry
+    runner.session_store.lookup_by_session_id.return_value = None
+    runner._session_key_for_source = MagicMock(
+        side_effect=lambda source: key_a if source == source_a else "agent:main:slack:dm:U2"
+    )
+
+    with pytest.raises(RuntimeError, match="target_session_key does not match"):
+        runner._resolve_session_inbox_source(
+            {
+                "source_json": source_b.to_dict(),
+                "target_session_key": key_a,
+            }
+        )
 
 
 @pytest.mark.asyncio

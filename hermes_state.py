@@ -13729,6 +13729,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return cur.rowcount == 1
         return bool(self._execute_write(_do))
 
+    def mark_session_inbox_event_model_started(self, event_id: str) -> bool:
+        """Atomically reserve the event's single allowed model turn.
+
+        The marker is intentionally never cleared. If a process dies after the
+        transcript is saved but before response_text is recorded, a later
+        claimant fails terminally instead of appending a duplicate turn.
+        """
+        now = time.time()
+
+        def _do(conn):
+            cur = conn.execute(
+                """UPDATE session_inbox_events SET model_started_at=?, updated_at=?
+                   WHERE id=? AND status='processing' AND model_started_at IS NULL
+                     AND response_text IS NULL""",
+                (now, now, event_id),
+            )
+            return cur.rowcount == 1
+
+        return bool(self._execute_write(_do))
+
     def mark_session_inbox_event_response_ready(self, event_id: str, response_text: str) -> None:
         now = time.time()
         self._execute_write(lambda conn: conn.execute(

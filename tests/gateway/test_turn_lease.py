@@ -212,6 +212,41 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     runner._post_turn_goal_continuation.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_inbox_dispatch_defers_lease_timeout_without_reserving_model_turn(
+    monkeypatch, tmp_path
+):
+    from gateway.run import SessionInboxTargetBusy
+    from tests.gateway.test_42039_duplicate_user_message import _bootstrap, _event
+
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    holder = await runner._turn_leases.acquire(
+        "sess-dedup", owner_key="holder-key", generation=1, timeout=1
+    )
+    assert holder is not None
+    monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.02")
+    runner.session_store.load_transcript.side_effect = AssertionError(
+        "transcript must not load after a turn-lease timeout"
+    )
+    runner._session_db = MagicMock()
+    runner._session_db.mark_session_inbox_event_model_started = AsyncMock(
+        return_value=True
+    )
+    event = _event()
+    event.internal = True
+    event.raw_message = {"session_inbox_event_id": "evt-lease-busy"}
+
+    try:
+        with pytest.raises(SessionInboxTargetBusy, match="lease is busy"):
+            await asyncio.wait_for(runner._handle_message(event), timeout=1)
+    finally:
+        assert runner._turn_leases.release(holder) is True
+
+    runner.session_store.load_transcript.assert_not_called()
+    runner._session_db.mark_session_inbox_event_model_started.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Bounded registry
 # ---------------------------------------------------------------------------
