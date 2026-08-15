@@ -1505,6 +1505,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
     """
     active_tool_dependencies = _m()._capture_active_tool_dependencies()
 
+    import re
     import tempfile
     import zipfile
     from urllib.request import urlretrieve
@@ -1513,34 +1514,22 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
     # completion line can report the transition (prime-agent#630 port).
     pre_update_version = _read_project_version()
 
-    # The ZIP fallback exists for Windows git-file-I/O breakage. It pulls a
-    # static archive from GitHub, which is fine for the default "main"
-    # channel but would silently ignore --branch and update from main even
-    # if the user asked for something else — exactly the silent-divergence
-    # bug --branch was added to prevent. Refuse to proceed in that case
-    # rather than lie.
+    # The managed Affinda distribution supports branch-specific ZIP fallback
+    # updates. Preserve upstream's dirty-tree protection while downloading the
+    # explicitly selected branch from the Affinda fork.
     branch = _m()._resolve_update_branch(args)
-    if branch != "main":
-        print(
-            f"✗ --branch={branch} is not supported on the Windows ZIP-fallback "
-            "update path."
-        )
-        print(
-            "  This path runs when git file I/O is broken on the system. "
-            "Either resolve the git-side breakage (typically an antivirus "
-            "or NTFS filter holding files open) and rerun `hermes update "
-            f"--branch {branch}`, or update against main with `hermes update`."
-        )
-        _m().sys.exit(1)
     _abort_zip_update_if_dirty_tree()
     zip_url = (
-        f"https://github.com/NousResearch/hermes-agent/archive/refs/heads/{branch}.zip"
+        f"https://github.com/affinda/hermes-agent/archive/refs/heads/{branch}.zip"
     )
 
     print("→ Downloading latest version...")
     tmp_dir = tempfile.mkdtemp(prefix="hermes-update-")
     try:
-        zip_path = os.path.join(tmp_dir, f"hermes-agent-{branch}.zip")
+        # Branch names commonly contain ``/``. They are valid in the GitHub
+        # archive URL but must not become path separators in the temp filename.
+        safe_branch = re.sub(r"[^A-Za-z0-9._-]+", "-", branch)
+        zip_path = os.path.join(tmp_dir, f"hermes-agent-{safe_branch}.zip")
         urlretrieve(zip_url, zip_path)
 
         print("→ Extracting...")
@@ -1691,7 +1680,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         print("  Your existing install was left in place.")
         print(
             "  Re-run `hermes update` to retry; if the agent won't start, "
-            "reinstall from https://hermes-agent.nousresearch.com"
+            "reinstall using AFFINDA_INSTALL.md from github.com/affinda/hermes-agent"
         )
         _m().sys.exit(1)
     finally:
@@ -2278,13 +2267,13 @@ def _discard_stashed_changes(
     return True
 
 OFFICIAL_REPO_URLS = {
-    "https://github.com/NousResearch/hermes-agent.git",
-    "git@github.com:NousResearch/hermes-agent.git",
-    "https://github.com/NousResearch/hermes-agent",
-    "git@github.com:NousResearch/hermes-agent",
+    "https://github.com/affinda/hermes-agent.git",
+    "git@github.com:affinda/hermes-agent.git",
+    "https://github.com/affinda/hermes-agent",
+    "git@github.com:affinda/hermes-agent",
 }
 
-OFFICIAL_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
+OFFICIAL_REPO_URL = "https://github.com/affinda/hermes-agent.git"
 
 SKIP_UPSTREAM_PROMPT_FILE = ".skip_upstream_prompt"
 
@@ -2410,7 +2399,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         # Ask user if they want to add upstream
         print()
         print("ℹ Your fork is not tracking the official Hermes repository.")
-        print("  This means you may miss updates from NousResearch/hermes-agent.")
+        print("  This means you may miss reviewed updates from affinda/hermes-agent.")
         print()
         try:
             response = (
@@ -2424,7 +2413,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             print("→ Adding upstream remote...")
             if _add_upstream_remote(git_cmd, cwd):
                 print(
-                    "  ✓ Added upstream: https://github.com/NousResearch/hermes-agent.git"
+                    "  ✓ Added upstream: https://github.com/affinda/hermes-agent.git"
                 )
                 has_upstream = True
             else:
@@ -2432,7 +2421,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
                 return
         else:
             print(
-                "  Skipped. Run 'git remote add upstream https://github.com/NousResearch/hermes-agent.git' to add later."
+                "  Skipped. Run 'git remote add upstream https://github.com/affinda/hermes-agent.git' to add later."
             )
             _mark_skip_upstream_prompt()
             return
@@ -6005,7 +5994,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else:
             print("✗ Not a git repository. Please reinstall:")
             print(
-                "  curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
+                "  curl -fsSL https://raw.githubusercontent.com/affinda/hermes-agent/affinda/slack-context-customization/scripts/install.sh | bash"
             )
             sys.exit(1)
 
@@ -6885,7 +6874,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(f"  ⚠ {failing_module} still fails to import after updating:")
             print(f"      {import_error}")
             print("    Run `hermes update` again — if it persists, reinstall:")
-            print("    https://hermes-agent.nousresearch.com")
+            print("    See AFFINDA_INSTALL.md at github.com/affinda/hermes-agent")
 
         node_failures = _update_node_dependencies()
         _m()._build_web_ui(_m().PROJECT_ROOT / "web")

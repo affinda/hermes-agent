@@ -277,13 +277,13 @@ class TestCmdUpdateBranchFallback:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_update_on_fork_checks_upstream_when_origin_up_to_date(
+    def test_update_on_fork_tracks_managed_origin_branch(
         self, mock_run, _mock_which, mock_args, capsys
     ):
-        """Regression for issue #26172: forks whose local HEAD already matches
-        origin/main must still consult upstream/main before printing
-        "Already up to date!" — otherwise a fork that's caught up to its own
-        origin but behind NousResearch/hermes-agent silently misses updates.
+        """The managed distribution tracks its customization branch on origin.
+
+        Upstream synchronization is owned by Affinda's weekly maintenance job;
+        end-user updates must not bypass the reviewed customization branch.
         """
         from hermes_cli import main as hm
 
@@ -298,10 +298,7 @@ class TestCmdUpdateBranchFallback:
         ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
             cmd_update(mock_args)
 
-        expected_git_cmd = (
-            ["git", "-c", "windows.appendAtomically=false"] if hm._is_windows() else ["git"]
-        )
-        sync_mock.assert_called_once_with(expected_git_cmd, PROJECT_ROOT)
+        sync_mock.assert_not_called()
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
@@ -832,35 +829,38 @@ class TestCmdUpdateCheckBranchFlag:
 
     @patch("hermes_cli.config.detect_install_method", return_value="git")
     @patch("subprocess.run")
-    def test_check_default_main_still_prefers_upstream(
+    def test_check_default_tracks_managed_origin_branch(
         self, mock_run, _mock_method, capsys
     ):
-        """No --branch (or --branch=None) preserves the upstream-then-origin probe."""
+        """No --branch checks the reviewed Affinda customization branch."""
         mock_run.side_effect = self._check_side_effect(
-            target_branch="main", verify_ok=True, commit_count="0"
+            target_branch="affinda/slack-context-customization",
+            verify_ok=True,
+            commit_count="0",
         )
         args = SimpleNamespace(check=True, branch=None)
 
         cmd_update(args)
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        # Should have tried upstream first.
-        assert any("fetch" in c and "upstream" in c for c in commands), commands
-        # Compare ref is upstream/main (upstream fetch succeeded).
+        assert any(
+            "fetch" in c
+            and "origin" in c
+            and "affinda/slack-context-customization" in c
+            for c in commands
+        ), commands
         rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert any("upstream/main" in c for c in rev_list_cmds), rev_list_cmds
+        assert any(
+            "origin/affinda/slack-context-customization" in c
+            for c in rev_list_cmds
+        ), rev_list_cmds
 
 
-class TestCmdUpdateZipBranchRefusal:
-    """``hermes update --branch=<non-main>`` must refuse on the ZIP fallback path.
+class TestCmdUpdateZipBranchSelection:
+    """The Affinda ZIP fallback follows the explicitly selected branch."""
 
-    The ZIP fallback hard-codes a GitHub archive URL for main.zip; honoring
-    --branch arbitrarily would require remote-branch existence checks the
-    fallback can't easily do. Refusing is the right move — silently lying
-    about which branch got installed is the bug --branch was meant to prevent.
-    """
-
-    def test_zip_fallback_refuses_non_main_branch(self, capsys):
+    @patch("urllib.request.urlretrieve", side_effect=RuntimeError("stop after URL check"))
+    def test_zip_fallback_uses_non_main_branch(self, mock_urlretrieve, capsys):
         from hermes_cli.main import _update_via_zip
 
         args = SimpleNamespace(branch="bb/gui")
@@ -868,11 +868,12 @@ class TestCmdUpdateZipBranchRefusal:
             _update_via_zip(args)
         assert exc_info.value.code == 1
 
-        out = capsys.readouterr().out
-        assert "bb/gui" in out
-        assert "not supported" in out
-        # No actual download attempted.
-        assert "Downloading latest version" not in out
+        url, zip_path = mock_urlretrieve.call_args.args
+        assert url == (
+            "https://github.com/affinda/hermes-agent/archive/refs/heads/bb/gui.zip"
+        )
+        assert zip_path.endswith("hermes-agent-bb-gui.zip")
+        assert "Downloading latest version" in capsys.readouterr().out
 
 
 def test_is_termux_env_true_for_termux_prefix():

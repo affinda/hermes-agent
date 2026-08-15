@@ -10277,7 +10277,7 @@ def _resolve_update_branch(args) -> str:
     ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
     the same answer.
     """
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    return (getattr(args, "branch", None) or "affinda/slack-context-customization").strip() or "affinda/slack-context-customization"
 
 
 def _size_delta_label(saved_mb: float) -> str:

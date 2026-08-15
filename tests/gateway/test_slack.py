@@ -4687,3 +4687,190 @@ class TestNativeTaskCardProgress:
             "chat.stopStream",
         ]
         assert adapter._native_task_card_streams == {}
+
+
+class TestAffindaSlackHumanContext:
+    @pytest.fixture()
+    def contextual_adapter(self):
+        config = PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "human_context_enabled": True,
+                "context_lookback_messages": 3,
+                "thread_gap_messages": 3,
+                "attention_window_minutes": 5,
+                "event_packet_enabled": True,
+            },
+        )
+        instance = SlackAdapter(config)
+        instance._app = MagicMock()
+        instance._app.client = AsyncMock()
+        instance._app.client.users_info = AsyncMock(
+            return_value={"user": {"is_bot": False, "real_name": "Human"}}
+        )
+        instance._bot_user_id = "U_BOT"
+        instance._team_bot_user_ids = {"T1": "U_BOT"}
+        instance._running = True
+        instance.handle_message = AsyncMock()
+        instance._resolve_user_name = AsyncMock(
+            side_effect=lambda uid, chat_id=None, team_id=None: uid
+        )
+        return instance
+
+    @pytest.mark.asyncio
+    async def test_channel_mention_adds_bounded_gap_and_event_packet(
+        self, contextual_adapter
+    ):
+        contextual_adapter._app.client.conversations_history = AsyncMock(
+            return_value={
+                "messages": [
+                    {"ts": "105.0", "user": "U1", "text": "<@U_BOT> current"},
+                    {"ts": "104.0", "user": "U2", "text": "second gap"},
+                    {"ts": "103.0", "user": "U3", "text": "first gap"},
+                    {"ts": "102.0", "user": "U4", "text": "outside lookback"},
+                ]
+            }
+        )
+
+        await contextual_adapter._handle_slack_message(
+            {
+                "text": "<@U_BOT> current",
+                "user": "U1",
+                "channel": "C1",
+                "channel_type": "channel",
+                "team": "T1",
+                "ts": "105.0",
+            }
+        )
+
+        event = contextual_adapter.handle_message.await_args.args[0]
+        history_call = contextual_adapter._app.client.conversations_history.await_args
+        assert history_call is not None
+        assert history_call.kwargs["latest"] == "105.0"
+        assert "[Slack event]" in event.channel_context
+        assert "agent_was_mentioned: true" in event.channel_context
+        assert '<slack_route mode="channel" />' in event.channel_context
+        assert "U3: first gap" in event.channel_context
+        assert "U2: second gap" in event.channel_context
+        assert "outside lookback" not in event.channel_context
+        assert event.text == "current"
+
+    @pytest.mark.asyncio
+    async def test_attention_packet_is_passive_only_inside_thread_window(
+        self, contextual_adapter, monkeypatch
+    ):
+        monkeypatch.setattr(_slack_mod.time, "monotonic", lambda: 100.0)
+        contextual_adapter._app.client.conversations_history = AsyncMock(
+            return_value={"messages": []}
+        )
+        await contextual_adapter._handle_slack_message(
+            {
+                "text": "<@U_BOT> start",
+                "user": "U1",
+                "channel": "C1",
+                "channel_type": "channel",
+                "team": "T1",
+                "ts": "100.0",
+            }
+        )
+        contextual_adapter.handle_message.reset_mock()
+        contextual_adapter._app.client.conversations_replies = AsyncMock(
+            return_value={"messages": []}
+        )
+
+        monkeypatch.setattr(_slack_mod.time, "monotonic", lambda: 120.0)
+        await contextual_adapter._handle_slack_message(
+            {
+                "text": "in-window follow-up",
+                "user": "U2",
+                "channel": "C1",
+                "channel_type": "channel",
+                "team": "T1",
+                "ts": "120.0",
+                "thread_ts": "100.0",
+            }
+        )
+        first = contextual_adapter.handle_message.await_args.args[0]
+        assert "passive_followup: true" in first.channel_context
+
+        contextual_adapter.handle_message.reset_mock()
+        monkeypatch.setattr(_slack_mod.time, "monotonic", lambda: 401.0)
+        await contextual_adapter._handle_slack_message(
+            {
+                "text": "later ordinary thread reply",
+                "user": "U2",
+                "channel": "C1",
+                "channel_type": "channel",
+                "team": "T1",
+                "ts": "401.0",
+                "thread_ts": "100.0",
+            }
+        )
+        second = contextual_adapter.handle_message.await_args.args[0]
+        assert "passive_followup: false" in second.channel_context
+
+    def test_delivery_watermark_never_moves_backward(self, contextual_adapter):
+        key = ("T1", "channel", "C1", None)
+        contextual_adapter._set_slack_last_seen(key, "105.0")
+        contextual_adapter._set_slack_last_seen(key, "104.0")
+        assert contextual_adapter._slack_context_last_seen[key] == "105.0"
+
+    @pytest.mark.asyncio
+    async def test_mpim_top_level_mention_activates_resulting_thread(
+        self, contextual_adapter
+    ):
+        contextual_adapter._app.client.conversations_history = AsyncMock(
+            return_value={"messages": []}
+        )
+        await contextual_adapter._handle_slack_message(
+            {
+                "text": "<@U_BOT> start",
+                "user": "U1",
+                "channel": "G1",
+                "channel_type": "mpim",
+                "team": "T1",
+                "ts": "500.0",
+            }
+        )
+        assert ("T1", "thread", "G1", "500.0") in (
+            contextual_adapter._slack_attention_until
+        )
+
+    @pytest.mark.asyncio
+    async def test_dynamic_route_controls_are_stripped_and_applied(
+        self, contextual_adapter
+    ):
+        contextual_adapter._app.client.chat_postMessage = AsyncMock(
+            return_value={"ts": "200.0"}
+        )
+
+        await contextual_adapter.send(
+            "C1",
+            '<slack_route mode="channel" />\nTop-level answer',
+            reply_to="100.0",
+            metadata={"thread_id": "100.0", "team_id": "T1"},
+        )
+        posted = contextual_adapter._app.client.chat_postMessage.await_args.kwargs
+        assert posted["text"] == "Top-level answer"
+        assert "thread_ts" not in posted
+
+    def test_dynamic_routing_disables_native_streaming(self, contextual_adapter):
+        assert contextual_adapter.supports_draft_streaming() is False
+
+    @pytest.mark.asyncio
+    async def test_top_level_dm_defaults_to_continuous_session(self, contextual_adapter):
+        contextual_adapter.config.extra["dm_top_level_threads_as_sessions"] = False
+        await contextual_adapter._handle_slack_message(
+            {
+                "text": "hello",
+                "user": "U1",
+                "channel": "D1",
+                "channel_type": "im",
+                "team": "T1",
+                "ts": "300.0",
+            }
+        )
+
+        event = contextual_adapter.handle_message.await_args.args[0]
+        assert event.source.thread_id is None

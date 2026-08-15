@@ -283,7 +283,7 @@ DEFAULT_CONFIG = {
         # noise; 180s is a compromise that catches spinning weak-model runs
         # (60+ tool iterations with tiny output) before users assume the
         # bot is dead and /restart.
-        "gateway_notify_interval": 180,
+        "gateway_notify_interval": 600,
         # Session stall watchdog (seconds). Scope (#76354): this is a
         # RECOVERY notifier for an in-process AIAgent that has an
         # adapter-queued follow-up (pending inbound / queued event) while its
@@ -867,7 +867,7 @@ DEFAULT_CONFIG = {
                                       # 0 for long-running rolling-compaction sessions
                                       # where you want nothing pinned except the
                                       # system prompt + rolling summary + recent tail.
-        "abort_on_summary_failure": False,  # When True, auto-compression that fails
+        "abort_on_summary_failure": True,  # When True, auto-compression that fails
                                       # to generate a summary (aux LLM errored / returned
                                       # non-JSON / timed out) aborts entirely instead of
                                       # dropping the middle window with a static
@@ -2207,6 +2207,14 @@ DEFAULT_CONFIG = {
         "ignore_other_user_mentions": False,
         # If True, require @mention in Slack thread replies too.
         "thread_require_mention": False,
+        # Affinda managed policy: one rolling top-level DM session plus bounded,
+        # per-turn human context that never rewrites cached conversation history.
+        "dm_top_level_threads_as_sessions": False,
+        "human_context_enabled": True,
+        "context_lookback_messages": 20,
+        "thread_gap_messages": 20,
+        "attention_window_minutes": 5,
+        "event_packet_enabled": True,
         "channel_prompts": {},         # Per-channel ephemeral system prompts
     },
 
