@@ -36,6 +36,7 @@ async def test_process_session_inbox_event_dispatches_internal_turn_to_source_js
     runner.session_store.switch_session.return_value = entry
     runner.session_store.get_entry.return_value = None
     runner.session_store.find_entry_by_session_id.return_value = None
+
     runner._handle_message = AsyncMock(return_value="reviewed result")
     runner._session_db = MagicMock()
     runner._session_db.mark_session_inbox_event_model_started = AsyncMock(
@@ -95,6 +96,7 @@ async def test_process_session_inbox_event_switches_session_when_source_key_poin
     runner.session_store.switch_session.return_value = target_entry
     runner.session_store.get_entry.return_value = None
     runner.session_store.find_entry_by_session_id.return_value = None
+
     runner._handle_message = AsyncMock(return_value=None)
     runner._session_db = MagicMock()
     runner._session_db.mark_session_inbox_event_model_started = AsyncMock(

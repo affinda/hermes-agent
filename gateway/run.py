@@ -13805,10 +13805,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Session selection mutates the live binding, so it must happen
             # only after the busy check. Response-ready retries never need to
             # reopen or switch a transcript merely to retry transport delivery.
-            entry = self.session_store.get_or_create_session(source)
+            entry = await self.async_session_store.get_or_create_session(source)
             target_id = str(event_row.get("target_session_id") or "").strip()
             if target_id and entry.session_id != target_id:
-                switched = self.session_store.switch_session(session_key, target_id)
+                switched = await self.async_session_store.switch_session(
+                    session_key, target_id
+                )
                 if switched is None:
                     raise RuntimeError(f"could not bind target session {target_id}")
                 self._evict_cached_agent(session_key)
