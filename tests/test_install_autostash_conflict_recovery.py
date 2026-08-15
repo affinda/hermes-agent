@@ -166,6 +166,75 @@ def test_install_sh_migrates_known_nous_checkout_to_affinda_distribution(
 
 @pytest.mark.live_system_guard_bypass
 @pytest.mark.skipif(
+    shutil.which("git") is None or shutil.which("bash") is None,
+    reason="needs git and bash",
+)
+def test_install_sh_repo_override_preserves_custom_existing_branch(
+    tmp_path: Path,
+) -> None:
+    seed = tmp_path / "seed-custom"
+    seed.mkdir()
+    _git(seed, "init")
+    (seed / "tracked.txt").write_text("base\n", encoding="utf-8")
+    _git(seed, "add", "tracked.txt")
+    _git(seed, "commit", "-m", "base")
+    _git(seed, "branch", "-M", "custom-release")
+
+    remote = tmp_path / "custom.git"
+    _git(tmp_path, "init", "--bare", str(remote))
+    _git(seed, "remote", "add", "origin", str(remote))
+    _git(seed, "push", "-u", "origin", "custom-release")
+
+    managed = tmp_path / "custom-checkout"
+    _git(
+        tmp_path,
+        "clone",
+        "--branch",
+        "custom-release",
+        str(remote),
+        str(managed),
+    )
+
+    upstream = tmp_path / "custom-upstream"
+    _git(
+        tmp_path,
+        "clone",
+        "--branch",
+        "custom-release",
+        str(remote),
+        str(upstream),
+    )
+    (upstream / "tracked.txt").write_text("updated\n", encoding="utf-8")
+    _git(upstream, "commit", "-am", "update custom branch")
+    _git(upstream, "push", "origin", "custom-release")
+
+    env = os.environ | {
+        "HERMES_HOME": str(tmp_path / "hermes-home-custom"),
+        "HERMES_INSTALL_DIR": str(managed),
+    }
+    result = subprocess.run(
+        [
+            "bash",
+            str(INSTALL_SH),
+            "--stage",
+            "repository",
+            "--non-interactive",
+            "--repo-url",
+            str(remote),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _git(managed, "branch", "--show-current").stdout.strip() == "custom-release"
+    assert (managed / "tracked.txt").read_text(encoding="utf-8") == "updated\n"
+
+
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.skipif(
     shutil.which("git") is None or POWERSHELL is None,
     reason="needs git and PowerShell",
 )

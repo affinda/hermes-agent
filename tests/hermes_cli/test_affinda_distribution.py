@@ -76,5 +76,6 @@ def test_installers_default_to_same_distribution_and_sanitize_zip_ref():
         assert MANAGED_BRANCH in text
         assert MANAGED_REPO in text
     assert "--repo-url" in shell
+    assert '${HERMES_INSTALL_REPO_URL_SSH:-${HERMES_INSTALL_REPO_URL:-' in shell
     assert "[string]$RepoUrl" in powershell
     assert "$safeZipLabel" in powershell

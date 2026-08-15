@@ -47,7 +47,7 @@ REPO_URL_EXPLICIT=false
 if [ -n "${HERMES_INSTALL_REPO_URL_SSH:-}${HERMES_INSTALL_REPO_URL_HTTPS:-}${HERMES_INSTALL_REPO_URL:-}" ]; then
     REPO_URL_EXPLICIT=true
 fi
-REPO_URL_SSH="${HERMES_INSTALL_REPO_URL_SSH:-git@github.com:affinda/hermes-agent.git}"
+REPO_URL_SSH="${HERMES_INSTALL_REPO_URL_SSH:-${HERMES_INSTALL_REPO_URL:-git@github.com:affinda/hermes-agent.git}}"
 REPO_URL_HTTPS="${HERMES_INSTALL_REPO_URL_HTTPS:-${HERMES_INSTALL_REPO_URL:-https://github.com/affinda/hermes-agent.git}}"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 # INSTALL_DIR is resolved AFTER arg parsing and OS detection so we can pick an
@@ -1291,7 +1291,8 @@ clone_repo() {
             esac
             if [ "$REPO_URL_EXPLICIT" = true ] || [ "$managed_origin" = true ]; then
                 git remote set-url origin "$REPO_URL_HTTPS"
-            elif [ "$BRANCH_EXPLICIT" = false ] && [ -n "$existing_branch" ]; then
+            fi
+            if [ "$BRANCH_EXPLICIT" = false ] && [ "$managed_origin" = false ] && [ -n "$existing_branch" ]; then
                 BRANCH="$existing_branch"
             fi
 

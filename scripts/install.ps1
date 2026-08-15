@@ -2056,7 +2056,8 @@ function Install-Repository {
                 if ($RepoUrlExplicit -or $managedOrigin) {
                     git -c windows.appendAtomically=false remote set-url origin $RepoUrlHttps
                     if ($LASTEXITCODE -ne 0) { throw "git remote set-url origin failed (exit $LASTEXITCODE)" }
-                } elseif ((-not $BranchExplicit) -and $existingBranch) {
+                }
+                if ((-not $BranchExplicit) -and (-not $managedOrigin) -and $existingBranch) {
                     $Branch = ("$existingBranch").Trim()
                 }
 
