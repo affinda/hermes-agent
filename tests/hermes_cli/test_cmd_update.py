@@ -83,7 +83,11 @@ def _patch_gateway_discovery():
     Discovery returning nothing makes the phase a clean no-op for every test
     in this module (none of them assert on gateway restarts).
     """
-    with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
+    # The real update pipeline purges and re-imports Hermes modules after the
+    # simulated pull. Keep that purge out of these unit tests so it cannot
+    # discard the gateway-discovery mocks and touch the live host.
+    with patch("hermes_cli.update_cmd._purge_stale_hermes_modules"), \
+         patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
          patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
          patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
         yield
@@ -308,6 +312,7 @@ class TestCmdUpdateBranchFallback:
         self, mock_run, _mock_which, mock_args, capsys
     ):
         """A fork sync that pulls code must continue through post-update work."""
+        mock_args.branch = "main"
         from hermes_cli import main as hm
         from hermes_cli import update_cmd
 
@@ -374,6 +379,7 @@ class TestCmdUpdateBranchFallback:
 
     def test_update_non_interactive_runs_safe_config_migrations(self, mock_args, capsys):
         """Dashboard/web updates apply non-interactive migrations before restart."""
+        mock_args.branch = "main"
         with patch("shutil.which", return_value=None), patch(
             "subprocess.run"
         ) as mock_run, patch("builtins.input") as mock_input, patch(
@@ -418,6 +424,7 @@ class TestCmdUpdateMigrationPrompt:
         self, mock_args, capsys
     ):
         """Only the version moved → apply non-interactively, never prompt."""
+        mock_args.branch = "main"
         with patch("shutil.which", return_value=None), patch(
             "subprocess.run"
         ) as mock_run, patch("builtins.input") as mock_input, patch(
@@ -457,6 +464,7 @@ class TestCmdUpdateMigrationPrompt:
         display.personality. Migration-step mutations (config_added) and
         warnings must be re-surfaced even in the silent branch.
         """
+        mock_args.branch = "main"
         with patch("shutil.which", return_value=None), patch(
             "subprocess.run"
         ) as mock_run, patch("builtins.input") as mock_input, patch(
@@ -493,6 +501,7 @@ class TestCmdUpdateMigrationPrompt:
         self, mock_args, capsys
     ):
         """New env/config keys are printed by name so the user can decide."""
+        mock_args.branch = "main"
         env_items = [
             {"name": "FOO_API_KEY", "description": "Foo service API key"},
         ]
@@ -571,6 +580,7 @@ class TestCmdUpdateProfileSkillSync:
     def test_active_profile_included_in_skill_sync(
         self, mock_run, _mock_which, mock_args, capsys
     ):
+        mock_args.branch = "main"
         from pathlib import Path
 
         mock_run.side_effect = _make_run_side_effect(
@@ -609,6 +619,7 @@ class TestCmdUpdateProfileSkillSync:
     def test_single_profile_default_is_synced(
         self, mock_run, _mock_which, mock_args, capsys
     ):
+        mock_args.branch = "main"
         from pathlib import Path
 
         mock_run.side_effect = _make_run_side_effect(
@@ -864,7 +875,9 @@ class TestCmdUpdateZipBranchSelection:
         from hermes_cli.main import _update_via_zip
 
         args = SimpleNamespace(branch="bb/gui")
-        with pytest.raises(SystemExit) as exc_info:
+        with patch(
+            "hermes_cli.update_cmd._abort_zip_update_if_dirty_tree"
+        ), pytest.raises(SystemExit) as exc_info:
             _update_via_zip(args)
         assert exc_info.value.code == 1
 
@@ -938,6 +951,7 @@ class TestNodeRuntimeNpmResolution:
 
     def test_wsl_update_skips_windows_npm_build_paths(self, mock_args, monkeypatch):
         """A Windows-only npm on WSL must not reach web or desktop builds."""
+        mock_args.branch = "main"
         from hermes_cli import main as hm
         import hermes_constants
 

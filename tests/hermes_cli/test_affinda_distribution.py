@@ -56,6 +56,7 @@ def test_zip_fallback_sanitizes_slash_branch_in_local_filename(
         raise RuntimeError("stop after destination capture")
 
     monkeypatch.setattr("urllib.request.urlretrieve", fail_after_capture)
+    monkeypatch.setattr(update_cmd, "_abort_zip_update_if_dirty_tree", lambda: None)
     monkeypatch.setattr(update_cmd._m().sys, "exit", lambda code: (_ for _ in ()).throw(SystemExit(code)))
 
     with pytest.raises(SystemExit):
